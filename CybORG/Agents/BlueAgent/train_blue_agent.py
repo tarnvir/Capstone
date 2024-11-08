@@ -1,10 +1,9 @@
-# train_blue_agent.py
-
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor as SB3Monitor
 from gymnasium import spaces
+import torch
 
 from CybORG import CybORG
 from CybORG.Simulator.Scenarios import EnterpriseScenarioGenerator
@@ -13,21 +12,38 @@ from CybORG.Simulator.Actions import Sleep, Analyse, Remove, Restore
 
 from my_blue_agent import MyBlueAgent, BlueAction
 
+# Define our own learning rate schedule function
+def linear_schedule(initial_value: float, final_value: float):
+    """
+    Linear learning rate schedule.
+    
+    Args:
+        initial_value: Initial learning rate
+        final_value: Final learning rate
+    """
+    def schedule(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0 (end)
+        """
+        return final_value + (initial_value - final_value) * progress_remaining
+
+    return schedule
+
 class BlueCybORGEnv(gym.Env):
     def __init__(self):
         super(BlueCybORGEnv, self).__init__()
 
-        # Initialize with much larger step limit to avoid the error
+        # Initialize with a larger step limit in order avoid the error
         max_steps = 500  # Episode length
         scenario_steps = 10000  # Much larger than episode length
-        sg = EnterpriseScenarioGenerator(steps=scenario_steps)  # Increased steps
+        sg = EnterpriseScenarioGenerator(steps=scenario_steps) 
         self.cyborg = CybORG(scenario_generator=sg)
         self.agent_name = 'blue_agent_0'
 
-        # Create action list FIRST
+        # Create action list
         self.action_list = self.create_action_list()
         
-        # THEN define observation and action spaces
+        # define observations and action spaces
         self.observation_space = spaces.Box(low=0, high=1, shape=(100,), dtype=np.float32)
         self.action_space = spaces.Discrete(self.get_action_space_size())
 
@@ -37,6 +53,7 @@ class BlueCybORGEnv(gym.Env):
 
         self.current_step = 0
         self.max_steps = max_steps
+        self.episode_rewards = []  # Track rewards for curriculum learning
 
     def reset(self, seed=None, options=None):
         """
@@ -108,7 +125,7 @@ class BlueCybORGEnv(gym.Env):
     def create_action_list(self):
         action_list = []
 
-        # Add Sleep action without parameters
+        # Add Slerep action without thge parameters
         action_list.append(BlueAction(Sleep))
         
         # Basic actions with parameters
@@ -117,10 +134,10 @@ class BlueCybORGEnv(gym.Env):
             'agent': self.agent_name
         }
 
-        # Add Monitor action
+        # Add Monitoring
         action_list.append(BlueAction(CybORGMonitor, default_params.copy()))
 
-        # Actions with hostnames
+        # Actions need  hostnames
         H = 16  # Number of hosts
         for i in range(H):
             hostname = f'Host_{i}'
@@ -137,25 +154,44 @@ class BlueCybORGEnv(gym.Env):
         return len(self.action_list)
 
     def calculate_reward(self, result):
-        """Improved reward function"""
         reward = result.reward
         observation = result.observation
 
-        # Base reward for taking action
-        reward += 0.1  # Small positive reward to encourage exploration
-        
-        # Reward for maintaining system health
+        # Base reward with random noise for exploration
+        reward += 0.1 + np.random.normal(0, 0.01)  # Small random noise
+
+        # System health assessment
         compromised_hosts = 0
-        for i in range(16):
+        total_hosts = 16
+        for i in range(total_hosts):
             host_key = f'host_{i}'
             if host_key in observation and 'Compromised' in observation[host_key]:
                 compromised_hosts += 1
-        
-        # Penalize based on number of compromised hosts
+
+        # Non-linear reward scaling
+        health_ratio = (total_hosts - compromised_hosts) / total_hosts
+        reward += np.power(health_ratio, 2) * 3.0  # Quadratic scaling
+
+        # Dynamic reward system
         if compromised_hosts == 0:
-            reward += 1.0  # Bonus for keeping all hosts safe
-        else:
-            reward -= compromised_hosts * 0.5  # Smaller penalty per compromised host
+            reward += 5.0 * (1.0 + np.random.uniform(0, 0.1))  # Variable perfect defense bonus
+        elif compromised_hosts < 3:
+            reward += 2.0
+        elif compromised_hosts < total_hosts / 2:
+            reward += 0.5
+
+        # Progressive penalties with randomness
+        if compromised_hosts > total_hosts / 2:
+            penalty = compromised_hosts * compromised_hosts / total_hosts
+            penalty *= (1.0 + np.random.uniform(0, 0.2))  # Variable penalty
+            reward -= penalty
+
+        # Dynamic time pressure
+        time_factor = np.sin(np.pi * self.current_step / self.max_steps)  # Sinusoidal time pressure
+        reward *= (1.0 + 0.5 * time_factor)
+
+        # Scale rewards
+        reward = reward / 30.0  # Adjusted scaling factor
 
         return reward
 
@@ -166,42 +202,100 @@ class BlueCybORGEnv(gym.Env):
 env = BlueCybORGEnv()
 env = SB3Monitor(env)
 
-# Instantiate the RL model
+# Enhanced PPO configuration with aggressive exploration
 model = PPO(
     'MlpPolicy', 
     env, 
     verbose=1,
-    ent_coef=0.05,  # Increased for more exploration
-    learning_rate=0.0001,  # Reduced for more stable learning
-    n_steps=2048,
-    batch_size=64,
-    n_epochs=10,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_range=0.2,
+    ent_coef=0.5,          # Much higher entropy for forced exploration
+    learning_rate=linear_schedule(0.003, 0.0001),  # Higher initial learning rate
+    n_steps=1024,          # Shorter rollouts
+    batch_size=32,         # Even smaller batch size
+    n_epochs=5,            # Fewer epochs but more frequent updates
+    gamma=0.99,            # Standard discount
+    clip_range=0.5,        # Even larger clip range
+    vf_coef=0.8,          # Adjusted value function coefficient
+    normalize_advantage=True,
+    target_kl=0.02,        # Target KL divergence
+    max_grad_norm=1.0,     # Keep gradient clipping
     policy_kwargs=dict(
-        net_arch=dict(pi=[64, 64], vf=[64, 64])
+        net_arch=dict(
+            pi=[256, 256, 128],  # Deeper policy network
+            vf=[512, 256, 128]   # Much larger value network
+        ),
+        activation_fn=torch.nn.ReLU,
+        ortho_init=True
     )
 )
 
-# Train the model
-total_timesteps = 5000000  # More timesteps for better learning
-model.learn(total_timesteps=total_timesteps)
+# Increased training time
+total_timesteps = 300000  # 50% more training time
 
-# Save the model
-model.save('ppo_blue_agent_model')
+# Training with evaluation callbacks
+from stable_baselines3.common.callbacks import EvalCallback
 
-# Evaluate the model
-episodes = 10
+# Create evaluation environment
+eval_env = BlueCybORGEnv()
+eval_env = SB3Monitor(eval_env)
+
+# Set up evaluation callback
+eval_callback = EvalCallback(
+    eval_env,
+    best_model_save_path='./logs/',
+    log_path='./logs/',
+    eval_freq=1000,        # Even more frequent evaluation
+    n_eval_episodes=15,    # More evaluation episodes
+    deterministic=True,
+    render=False
+)
+
+# Add training stability callback
+from stable_baselines3.common.callbacks import CheckpointCallback
+
+# Create checkpoint callback
+checkpoint_callback = CheckpointCallback(
+    save_freq=2000,        # More frequent checkpoints
+    save_path="./logs/",
+    name_prefix="ppo_blue_model",
+    save_replay_buffer=True,
+    save_vecnormalize=True,
+)
+
+# Combine callbacks
+callbacks = [eval_callback, checkpoint_callback]
+
+# Train with both callbacks
+model.learn(
+    total_timesteps=total_timesteps,
+    callback=callbacks
+)
+
+# Enhanced evaluation
+episodes = 20  # Increased from 10 for better evaluation
+eval_rewards = []
+
 for episode in range(episodes):
-    # Fix: Only take first element (observation) from reset() tuple
     obs, _ = env.reset()
     done = False
     total_reward = 0
+    steps = 0
+    
     while not done:
-        action, _ = model.predict(obs, deterministic=True)  # Added deterministic=True for evaluation
-        # Fix: Handle both terminated and truncated conditions
+        action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
+        steps += 1
         done = terminated or truncated
-    print(f'Episode {episode + 1}: Total Reward = {total_reward}')
+        
+    eval_rewards.append(total_reward)
+    print(f'Episode {episode + 1}: Total Reward = {total_reward}, Steps = {steps}')
+
+# Print evaluation statistics
+print(f'\nEvaluation Statistics:')
+print(f'Average Reward: {np.mean(eval_rewards):.2f}')
+print(f'Std Dev Reward: {np.std(eval_rewards):.2f}')
+print(f'Min Reward: {np.min(eval_rewards):.2f}')
+print(f'Max Reward: {np.max(eval_rewards):.2f}')
+
+# Save the model
+model.save('ppo_blue_agent_model')
