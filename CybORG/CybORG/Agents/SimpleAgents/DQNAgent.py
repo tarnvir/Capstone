@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
 
 class DQNNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -195,3 +196,21 @@ class DQNAgent:
                 mask[list(action_space)] = 1
                 q_values = q_values.masked_fill(mask.eq(0), float('-inf'))
             return q_values.argmax(1).item()
+    
+    def save(self, path):
+        """Save the DQN model"""
+        torch.save({
+            'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon
+        }, path)
+    
+    def load(self, path):
+        """Load the DQN model"""
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=self.device)
+            self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+            self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.epsilon = checkpoint['epsilon']

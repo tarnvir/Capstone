@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from collections import defaultdict
 import torch.nn as nn
+import os
 
 from CybORG.Agents.SimpleAgents.PPOBlueAgent import PPOBlueAgent
 from CybORG.Agents.SimpleAgents.DQNAgent import DQNAgent
@@ -16,181 +17,112 @@ class HybridBlueAgent:
         # Initialize MSE Loss
         self.MSE_loss = nn.MSELoss()
         
-        # Initialize optimizer
-        self.optimizer = None  # Will be initialized after policy creation
-        
         # Initialize min_batch_size
         self.min_batch_size = 32
         
-        # System priorities must be defined first
-        self.system_priorities = {
-            'enterprise0': 0.5,
-            'enterprise1': 0.3,
-            'enterprise2': 0.2,
-            'opserver0': 0.0
+        # Initialize action tracking without lambda functions
+        self.action_stats = {
+            'success_rate': {},
+            'reward_history': {},
+            'usage_count': {},
+            'last_success': {}
         }
         
-        # Base priorities copy can now be created
-        self.base_priorities = self.system_priorities.copy()
+        # Initialize the success_rate dictionary properly
+        for action in range(output_dim):
+            self.action_stats['success_rate'][action] = {'successes': 0, 'attempts': 0}
+            self.action_stats['reward_history'][action] = []
+            self.action_stats['usage_count'][action] = 0
+            self.action_stats['last_success'][action] = 0
         
-        # Initialize PPO and DQN agents
-        self.ppo_agent = PPOBlueAgent(input_dim, hidden_dim, output_dim)
-        self.dqn_agent = DQNAgent(input_dim, hidden_dim, output_dim)
-        
-        # Add dynamic action sequences
-        self.action_sequences = {
-            'monitor_analyze': {
-                'enterprise0': [1, 3],
-                'enterprise1': [1, 4],
-                'enterprise2': [1, 5],
-                'opserver0': [1, 9]
-            },
-            'analyze_restore': {
-                'enterprise0': [3, 133],
-                'enterprise1': [4, 134],
-                'enterprise2': [5, 135],
-                'opserver0': [9, 139]
-            }
-        }
-        
-        # Add success tracking per sequence
-        self.sequence_success = defaultdict(lambda: {'successes': 0, 'attempts': 0})
-        
-        # Add system state tracking
-        self.system_states = {
-            'enterprise0': {'compromised': False, 'last_action': None, 'success_rate': 0},
-            'enterprise1': {'compromised': False, 'last_action': None, 'success_rate': 0},
-            'enterprise2': {'compromised': False, 'last_action': None, 'success_rate': 0},
-            'opserver0': {'compromised': False, 'last_action': None, 'success_rate': 0}
-        }
-        
-        # Track current sequence
-        self.current_sequence = None
-        self.sequence_position = 0
-        
-        # Store history
-        self.last_observation = None
-        self.current_observation = None
-        self.actions = []
-        self.rewards = []
-        
-        # Mixing weights
-        self.ppo_weight = 0.7  # 70% PPO, 30% DQN
-        
-        # Initialize valid actions first
-        self.valid_actions = {
-            0,                          # Sleep
-            1,                          # Monitor
-            3, 4, 5, 9,                # Analyze enterprise and opserver
-            133, 134, 135, 139,        # Restore enterprise and opserver
-            16, 17, 18, 22             # Remove enterprise and opserver
-        }
-        
-        # Initialize success memory for all possible actions
+        # Initialize success memory
         self.success_memory = {}
         for action in range(output_dim):
             self.success_memory[action] = 0.0
         
-        # Make sure all valid actions are in success memory
-        for action in self.valid_actions:
-            if action not in self.success_memory:
-                self.success_memory[action] = 0.0
+        # Initialize Memory
+        self.memory = Memory()
         
-        # Enhanced exploration parameters
-        self.exploration_params = {
-            'initial_epsilon': 0.9,
-            'final_epsilon': 0.05,
-            'epsilon_decay': 0.995,
-            'current_epsilon': 0.9,
-            'exploration_bonus': 0.1  # Bonus for trying new actions
-        }
-        
-        # Reward shaping parameters
-        self.reward_shaping = {
-            'monitor_bonus': 2.0,      # Increased from 1.0
-            'analyze_bonus': 3.0,      # Increased from 2.0
-            'restore_bonus': 5.0,      # Increased from 3.0
-            'sequence_bonus': 10.0,    # Increased from 5.0
-            'enterprise_bonus': 4.0,   # Increased from 2.0
-            'speed_bonus': 1.0         # Increased from 0.5
-        }
-        
-        # Action diversity tracking
-        self.action_history = []
-        self.action_frequencies = defaultdict(int)
-        self.min_action_frequency = 0.1  # Minimum desired frequency per action
-        
-        # Add adaptive exploration
-        self.adaptive_params = {
-            'decay': 1.0,
-            'min_decay': 0.8,
-            'max_decay': 1.0,
-            'reward_threshold': -5.0,
-            'history_window': 50
-        }
-        
-        # Track rewards for adaptation
-        self.rewards_history = []
-        
-        # Add forced start sequence
-        self.start_sequence = [1, 3, 133]  # Monitor -> Analyze -> Restore
-        self.start_position = 0
-        
-        # Add pattern recognition
-        self.action_patterns = {
-            'defensive': [1, 3, 133],
-            'aggressive': [3, 133, 1],
-            'cautious': [1, 0, 1]
-        }
-        
-        # Replace our simple networks with their ActorCritic
+        # Initialize networks
         self.policy = ActorCritic(input_dim, output_dim).to(self.device)
         self.old_policy = ActorCritic(input_dim, output_dim).to(self.device)
         self.old_policy.load_state_dict(self.policy.state_dict())
         
-        # Replace our memory with their Memory class
-        self.memory = Memory()
-        
-        # Remove our separate actor/critic networks since we're using their ActorCritic
-        # self.actor = ...  # Remove
-        # self.critic = ... # Remove
-        
-        # Initialize with better parameters
+        # Initialize training parameters
         self.gamma = 0.99
         self.lr = 0.002
         self.betas = [0.9, 0.990]
         self.K_epochs = 6
         self.eps_clip = 0.2
-
-        # Add their start actions sequence
-        self.start_actions = [1004, 1004, 1000]  # user 2 decoy * 2, ent0 decoy
         
-        # Reduce sleep probability
-        self.sleep_threshold = 0.1  # Reduced from 0.3
+        # Initialize action history
+        self.actions = []
+        self.rewards = []
+        self.rewards_history = []
         
-        # Force more complete sequences
-        self.min_actions_before_sleep = 3  # Must try at least 3 actions before sleeping
-        
-        # After policy initialization, create optimizer
+        # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr, betas=self.betas)
     
     def get_action(self, observation, action_space):
-        """Get action using their approach"""
-        # Convert observation to tensor
+        """Get action using PPO with better defensive sequences"""
         state = torch.FloatTensor(observation).to(self.device)
         
-        # Convert valid_actions set to list for indexing
-        valid_actions_list = list(self.valid_actions)
-        
-        # Use their ActorCritic to get action
-        action_idx = self.old_policy.act(state, self.memory)
-        
-        # Convert action index to valid action
-        action = valid_actions_list[action_idx % len(valid_actions_list)]  # Use modulo to ensure valid index
-        
-        # Store action
-        self.actions.append(action)
-        return action
+        with torch.no_grad():
+            action_probs = self.policy.actor(state)
+            
+            # Convert action_space to list if it isn't already
+            action_space = list(action_space) if not isinstance(action_space, list) else action_space
+            
+            # Create action mask
+            mask = torch.zeros_like(action_probs)
+            for i, action in enumerate(action_space):
+                mask[i] = 1
+            action_probs = action_probs * mask
+            
+            # Normalize probabilities
+            action_probs = action_probs / (action_probs.sum() + 1e-10)
+            
+            # Strongly encourage defensive sequences
+            if len(self.actions) > 0:
+                last_action = self.actions[-1]
+                
+                # After analyze, force restore
+                analyze_to_restore = {3:133, 4:134, 5:135, 9:139}
+                if last_action in analyze_to_restore:
+                    restore_action = analyze_to_restore[last_action]
+                    if restore_action in action_space:
+                        self.actions.append(restore_action)
+                        return restore_action
+                
+                # After monitor (action 1), prioritize analyze
+                if last_action == 1:
+                    analyze_actions = [3,4,5,9]  # analyze enterprise and opserver
+                    valid_analyzes = [a for a in analyze_actions if a in action_space]
+                    if valid_analyzes:
+                        action = np.random.choice(valid_analyzes)
+                        self.actions.append(action)
+                        return action
+            
+            # Periodically force monitoring
+            if len(self.actions) % 3 == 0:
+                if 1 in action_space:  # Monitor action
+                    self.actions.append(1)
+                    return 1
+            
+            # Sample action using the policy if no forced actions
+            dist = torch.distributions.Categorical(action_probs)
+            action_idx = dist.sample().item()
+            
+            # Store for PPO update
+            self.memory.states.append(state)
+            self.memory.actions.append(torch.tensor(action_idx))
+            self.memory.logprobs.append(dist.log_prob(torch.tensor(action_idx)))
+            
+            # Convert action index to actual action
+            action = action_space[action_idx % len(action_space)]
+            self.actions.append(action)
+            
+            return action
     
     def _get_best_action(self, observation):
         """Get the best action based on past success"""
@@ -357,59 +289,65 @@ class HybridBlueAgent:
     def update(self, next_state, done):
         """Update using their PPO implementation"""
         # Set terminal flag for episode end
-        if done:
+        if done and len(self.memory.rewards) > 0:  # Only set if we have rewards
             self.memory.is_terminals[-1] = True
         
         # Only update if we have enough experience
-        if len(self.memory.rewards) >= self.min_batch_size:
-            # Calculate returns and advantages
-            returns = []
-            discounted_reward = 0
-            for reward, is_terminal in zip(reversed(self.memory.rewards), 
-                                         reversed(self.memory.is_terminals)):
-                if is_terminal:
-                    discounted_reward = 0
-                discounted_reward = reward + (self.gamma * discounted_reward)
-                returns.insert(0, discounted_reward)
-            
-            # Normalize returns
-            returns = torch.tensor(returns).to(self.device)
-            returns = (returns - returns.mean()) / (returns.std() + 1e-5)
-            
-            # Get old states, actions, logprobs
-            old_states = torch.stack(self.memory.states).to(self.device).detach()
-            old_actions = torch.stack(self.memory.actions).to(self.device).detach()
-            old_logprobs = torch.stack(self.memory.logprobs).to(self.device).detach()
-            
-            # Update policy for K epochs
-            for _ in range(self.K_epochs):
-                # Evaluate actions and values
-                logprobs, state_values, dist_entropy = self.policy.evaluate(
-                    old_states, old_actions)
+        if len(self.memory.states) >= self.min_batch_size:  # Check states instead of rewards
+            try:
+                # Calculate returns and advantages
+                returns = []
+                discounted_reward = 0
+                for reward, is_terminal in zip(reversed(self.memory.rewards), 
+                                             reversed(self.memory.is_terminals)):
+                    if is_terminal:
+                        discounted_reward = 0
+                    discounted_reward = reward + (self.gamma * discounted_reward)
+                    returns.insert(0, discounted_reward)
                 
-                # Calculate advantages
-                advantages = returns - state_values.detach()
+                # Normalize returns
+                returns = torch.tensor(returns).to(self.device)
+                returns = (returns - returns.mean()) / (returns.std() + 1e-5)
                 
-                # Calculate ratios
-                ratios = torch.exp(logprobs - old_logprobs.detach())
+                # Get old states, actions, logprobs
+                old_states = torch.stack(self.memory.states).to(self.device).detach()
+                old_actions = torch.stack(self.memory.actions).to(self.device).detach()
+                old_logprobs = torch.stack(self.memory.logprobs).to(self.device).detach()
                 
-                # Calculate surrogate losses
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+                # Update policy for K epochs
+                for _ in range(self.K_epochs):
+                    # Evaluate actions and values
+                    logprobs, state_values, dist_entropy = self.policy.evaluate(
+                        old_states, old_actions)
+                    
+                    # Calculate advantages
+                    advantages = returns - state_values.detach()
+                    
+                    # Calculate ratios
+                    ratios = torch.exp(logprobs - old_logprobs.detach())
+                    
+                    # Calculate surrogate losses
+                    surr1 = ratios * advantages
+                    surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+                    
+                    # Calculate final loss
+                    loss = -torch.min(surr1, surr2) + 0.5 * self.MSE_loss(state_values, returns) - 0.01 * dist_entropy
+                    
+                    # Update policy
+                    self.optimizer.zero_grad()
+                    loss.mean().backward()
+                    self.optimizer.step()
                 
-                # Calculate final loss
-                loss = -torch.min(surr1, surr2) + 0.5 * self.MSE_loss(state_values, returns) - 0.01 * dist_entropy
+                # Copy new weights into old policy
+                self.old_policy.load_state_dict(self.policy.state_dict())
                 
-                # Update policy
-                self.optimizer.zero_grad()
-                loss.mean().backward()
-                self.optimizer.step()
-            
-            # Copy new weights into old policy
-            self.old_policy.load_state_dict(self.policy.state_dict())
-            
-            # Clear memory
-            self.memory.clear_memory()
+                # Clear memory
+                self.memory.clear_memory()
+                
+            except Exception as e:
+                print(f"Error in update: {str(e)}")
+                self.memory.clear_memory()  # Clear memory on error
+                return
         
         # Reset if episode done
         if done:
@@ -421,14 +359,34 @@ class HybridBlueAgent:
             self.current_observation = None
     
     def save(self, path):
-        # Save both agents
-        self.ppo_agent.save(path + '_ppo')
-        self.dqn_agent.save(path + '_dqn')
+        """Save model and training state"""
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'old_policy_state_dict': self.old_policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'success_memory': self.success_memory,
+            'action_stats': self.action_stats,
+            'hyperparameters': {
+                'gamma': self.gamma,
+                'lr': self.lr,
+                'eps_clip': self.eps_clip,
+                'K_epochs': self.K_epochs
+            }
+        }, path)
     
     def load(self, path):
-        # Load both agents
-        self.ppo_agent.load(path + '_ppo')
-        self.dqn_agent.load(path + '_dqn')
+        """Load model and training state"""
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=self.device)
+            self.policy.load_state_dict(checkpoint['policy_state_dict'])
+            self.old_policy.load_state_dict(checkpoint['old_policy_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.success_memory = checkpoint['success_memory']
+            self.action_stats = checkpoint['action_stats']
+            
+            # Load hyperparameters
+            for key, value in checkpoint['hyperparameters'].items():
+                setattr(self, key, value)
     
     def _update_adaptive_decay(self):
         """Update decay based on recent performance"""
@@ -469,56 +427,21 @@ class HybridBlueAgent:
         """Shape the reward to encourage desired behavior"""
         shaped_reward = reward
         
-        # Detect and penalize loops
-        if len(self.actions) >= 4:
-            if len(set(self.actions[-4:])) == 1:  # Same action repeated 4 times
-                shaped_reward -= 5.0
-                print("Penalty applied for looping actions.")
+        # Stronger penalties for allowing system compromise
+        if reward < -5:
+            shaped_reward *= 1.5
         
-        # Reward successful sequences
+        # Much higher rewards for successful defensive sequences
         if len(self.actions) >= 3:
             last_three = self.actions[-3:]
             if (last_three[0] == 1 and  # Monitor
                 last_three[1] in [3,4,5,9] and  # Analyze
                 last_three[2] in [133,134,135,139]):  # Restore
-                
-                shaped_reward += self.reward_shaping['sequence_bonus']
+                shaped_reward += 10.0  # Increased from 5.0
                 
                 # Extra bonus for enterprise systems
-                if last_three[1] in [3,4,5]:  # Enterprise system
-                    shaped_reward += self.reward_shaping['enterprise_bonus']
-                    
-                # Speed bonus
-                steps_taken = len(self.actions)
-                if steps_taken < 10:
-                    shaped_reward += self.reward_shaping['speed_bonus'] * (10 - steps_taken)
-                    
-                # Success bonus
-                if reward > 0:
-                    shaped_reward *= 1.5  # 50% bonus for successful sequences
-        
-        # Penalize sleeping too early
-        if len(self.actions) > 0 and self.actions[-1] == 0:
-            if len(self.actions) < self.min_actions_before_sleep:
-                shaped_reward -= 3.0
-        
-        # Reward for monitoring when needed
-        if len(self.actions) > 0 and self.actions[-1] == 1:
-            if any(self._is_system_at_risk(self.current_observation, sys) 
-                   for sys in ['enterprise0', 'enterprise1', 'enterprise2', 'opserver0']):
-                shaped_reward += self.reward_shaping['monitor_bonus']
-        
-        # Reward for analyzing after monitoring
-        if len(self.actions) >= 2:
-            if self.actions[-2] == 1 and self.actions[-1] in [3,4,5,9]:
-                shaped_reward += self.reward_shaping['analyze_bonus']
-        
-        # Reward for restoring after analyzing
-        if len(self.actions) >= 2:
-            last_two = self.actions[-2:]
-            analyze_to_restore = {3: 133, 4: 134, 5: 135, 9: 139}
-            if last_two[0] in analyze_to_restore and last_two[1] == analyze_to_restore[last_two[0]]:
-                shaped_reward += self.reward_shaping['restore_bonus']
+                if last_three[1] in [3,4,5]:
+                    shaped_reward += 5.0  # Increased from 2.0
         
         return shaped_reward
     
