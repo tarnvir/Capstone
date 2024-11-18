@@ -14,6 +14,9 @@ class HybridBlueAgent:
         # Initialize device first
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
+        # Initialize step counter
+        self.step_counter = 0
+        
         # Initialize MSE Loss
         self.MSE_loss = nn.MSELoss()
         
@@ -62,54 +65,111 @@ class HybridBlueAgent:
         
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr, betas=self.betas)
+        
+        # Add decoy strategy components
+        self.decoy_systems = {
+            'decoy1': {'status': 'inactive', 'attractiveness': 0.7},
+            'decoy2': {'status': 'inactive', 'attractiveness': 0.5},
+            'decoy3': {'status': 'inactive', 'attractiveness': 0.3}
+        }
+        
+        # Decoy-related actions
+        self.decoy_actions = {
+            'deploy_decoy': [150, 151, 152],  # Example action IDs for deploying decoys
+            'monitor_decoy': [160, 161, 162], # Example action IDs for monitoring decoys
+            'remove_decoy': [170, 171, 172]   # Example action IDs for removing compromised decoys
+        }
+        
+        # Decoy strategy configuration
+        self.decoy_config = {
+            'enterprise0': {'decoy_active': False, 'last_check': 0, 'attractiveness': 0.8},
+            'enterprise1': {'decoy_active': False, 'last_check': 0, 'attractiveness': 0.7},
+            'enterprise2': {'decoy_active': False, 'last_check': 0, 'attractiveness': 0.7},
+            'opserver0': {'decoy_active': False, 'last_check': 0, 'attractiveness': 0.9}
+        }
+        
+        # Decoy action mappings
+        self.decoy_actions = {
+            'enterprise0': {'deploy': 150, 'monitor': 160, 'remove': 170},
+            'enterprise1': {'deploy': 151, 'monitor': 161, 'remove': 171},
+            'enterprise2': {'deploy': 152, 'monitor': 162, 'remove': 172},
+            'opserver0': {'deploy': 153, 'monitor': 163, 'remove': 173}
+        }
+        
+        # Decoy strategy parameters
+        self.decoy_params = {
+            'deploy_threshold': 0.6,  # Threat level to deploy decoy
+            'check_interval': 5,      # Steps between decoy checks
+            'max_decoys': 2,          # Maximum concurrent decoys
+            'redeploy_cooldown': 10   # Steps before redeploying on same host
+        }
     
     def get_action(self, observation, action_space):
-        """Get action using PPO with better defensive sequences"""
+        """Get action using PPO with strictly enforced defensive sequences"""
+        # Increment step counter
+        self.step_counter += 1
+        
         state = torch.FloatTensor(observation).to(self.device)
         
+        # Convert action_space to list if it isn't already
+        action_space = list(action_space) if not isinstance(action_space, list) else action_space
+        
+        # Check if decoy deployment is needed
+        # Force defensive sequences
+        if len(self.actions) > 0:
+            last_action = self.actions[-1]
+            
+            # After monitor (action 1), must analyze
+            if last_action == 1:
+                analyze_actions = [3,4,5,9]  # analyze enterprise and opserver
+                valid_analyzes = [a for a in analyze_actions if a in action_space]
+                if valid_analyzes:
+                    action = np.random.choice(valid_analyzes)
+                    self.actions.append(action)
+                    return action
+            
+            # After analyze, must restore
+            analyze_to_restore = {3:133, 4:134, 5:135, 9:139}
+            if last_action in analyze_to_restore:
+                restore_action = analyze_to_restore[last_action]
+                if restore_action in action_space:
+                    self.actions.append(restore_action)
+                    return restore_action
+        
+        # Force monitoring every 3 steps if no sequence is in progress
+        if len(self.actions) % 3 == 0 and 1 in action_space:
+            self.actions.append(1)
+            return 1
+        
+        # Check if decoy action is needed
+        decoy_action = self._get_decoy_action(observation)
+        if decoy_action and decoy_action in action_space:
+            return decoy_action
+        
+        # If no forced actions, use policy
         with torch.no_grad():
             action_probs = self.policy.actor(state)
             
-            # Convert action_space to list if it isn't already
-            action_space = list(action_space) if not isinstance(action_space, list) else action_space
-            
-            # Create action mask
+            # Mask invalid actions
             mask = torch.zeros_like(action_probs)
             for i, action in enumerate(action_space):
                 mask[i] = 1
             action_probs = action_probs * mask
             
+            # Boost probabilities for defensive actions
+            for action in action_space:
+                idx = action_space.index(action)
+                if action == 1:  # monitor
+                    action_probs[idx] *= 2.0
+                elif action in [3,4,5,9]:  # analyze
+                    action_probs[idx] *= 1.5
+                elif action in [133,134,135,139]:  # restore
+                    action_probs[idx] *= 1.5
+            
             # Normalize probabilities
             action_probs = action_probs / (action_probs.sum() + 1e-10)
             
-            # Strongly encourage defensive sequences
-            if len(self.actions) > 0:
-                last_action = self.actions[-1]
-                
-                # After analyze, force restore
-                analyze_to_restore = {3:133, 4:134, 5:135, 9:139}
-                if last_action in analyze_to_restore:
-                    restore_action = analyze_to_restore[last_action]
-                    if restore_action in action_space:
-                        self.actions.append(restore_action)
-                        return restore_action
-                
-                # After monitor (action 1), prioritize analyze
-                if last_action == 1:
-                    analyze_actions = [3,4,5,9]  # analyze enterprise and opserver
-                    valid_analyzes = [a for a in analyze_actions if a in action_space]
-                    if valid_analyzes:
-                        action = np.random.choice(valid_analyzes)
-                        self.actions.append(action)
-                        return action
-            
-            # Periodically force monitoring
-            if len(self.actions) % 3 == 0:
-                if 1 in action_space:  # Monitor action
-                    self.actions.append(1)
-                    return 1
-            
-            # Sample action using the policy if no forced actions
+            # Sample action
             dist = torch.distributions.Categorical(action_probs)
             action_idx = dist.sample().item()
             
@@ -349,8 +409,9 @@ class HybridBlueAgent:
                 self.memory.clear_memory()  # Clear memory on error
                 return
         
-        # Reset if episode done
+        # Reset step counter if episode done
         if done:
+            self.step_counter = 0
             self.current_sequence = None
             self.sequence_position = 0
             self.actions = []
@@ -444,4 +505,114 @@ class HybridBlueAgent:
                     shaped_reward += 5.0  # Increased from 2.0
         
         return shaped_reward
+    
+    def _get_decoy_action(self, observation):
+        """Determine if and where to deploy decoys"""
+        # Count active decoys
+        active_decoys = sum(1 for host in self.decoy_config.values() 
+                           if host['decoy_active'])
+        
+        # Check if we can deploy more decoys
+        if active_decoys >= self.decoy_params['max_decoys']:
+            return self._monitor_existing_decoys(observation)
+        
+        # Assess each potential decoy location
+        for host, config in self.decoy_config.items():
+            # Skip if decoy already active or in cooldown
+            if config['decoy_active'] or \
+               (self.step_counter - config['last_check']) < self.decoy_params['redeploy_cooldown']:
+                continue
+            
+            # Calculate threat level for this host
+            threat_level = self._calculate_host_threat(observation, host)
+            
+            # Deploy if threat exceeds threshold
+            if threat_level > self.decoy_params['deploy_threshold']:
+                config['decoy_active'] = True
+                config['last_check'] = self.step_counter
+                return self.decoy_actions[host]['deploy']
+        
+        return self._monitor_existing_decoys(observation)
+    
+    def _monitor_existing_decoys(self, observation):
+        """Monitor and maintain existing decoys"""
+        for host, config in self.decoy_config.items():
+            if not config['decoy_active']:
+                continue
+            
+            # Check decoy periodically
+            if (self.step_counter - config['last_check']) >= self.decoy_params['check_interval']:
+                config['last_check'] = self.step_counter
+            
+                # Check if decoy was accessed
+                if self._was_decoy_accessed(observation, host):
+                    # Remove compromised decoy
+                    config['decoy_active'] = False
+                    return self.decoy_actions[host]['remove']
+            
+                # Regular monitoring
+                return self.decoy_actions[host]['monitor']
+        
+        return None
+    
+    def _calculate_host_threat(self, observation, host, check_neighbors=True):
+        """Calculate threat level for a specific host"""
+        # Host-specific observation indices
+        host_indices = {
+            'enterprise0': (0, 4),
+            'enterprise1': (4, 8),
+            'enterprise2': (8, 12),
+            'opserver0': (28, 32)
+        }
+        
+        if host in host_indices:
+            start, end = host_indices[host]
+            host_obs = observation[start:end]
+            
+            # Calculate base threat from observation
+            base_threat = sum(host_obs) / len(host_obs)
+            
+            # Add attractiveness modifier
+            threat = base_threat * self.decoy_config[host]['attractiveness']
+            
+            # Only check neighbors if flag is True (to prevent recursion)
+            if check_neighbors:
+                # Add proximity bonus if nearby hosts are compromised
+                if self._are_nearby_hosts_compromised(observation, host):
+                    threat *= 1.2
+            
+            return threat
+        
+        return 0.0
+    
+    def _are_nearby_hosts_compromised(self, observation, host):
+        """Check if hosts in the same subnet are compromised"""
+        subnets = {
+            'enterprise0': ['enterprise1', 'enterprise2'],
+            'enterprise1': ['enterprise0', 'enterprise2'],
+            'enterprise2': ['enterprise0', 'enterprise1'],
+            'opserver0': []  # Isolated in its own subnet
+        }
+        
+        if host in subnets:
+            for nearby_host in subnets[host]:
+                # Call _calculate_host_threat with check_neighbors=False to prevent recursion
+                if self._calculate_host_threat(observation, nearby_host, check_neighbors=False) > 0.7:
+                    return True
+        return False
+    
+    def _was_decoy_accessed(self, observation, host):
+        """Check if a decoy was accessed based on observation"""
+        # Implementation depends on how decoy access is represented in observation
+        # This is a simplified example
+        host_indices = {
+            'enterprise0': 40,  # Example index for decoy access flag
+            'enterprise1': 41,
+            'enterprise2': 42,
+            'opserver0': 43
+        }
+        
+        if host in host_indices:
+            return observation[host_indices[host]] > 0.5
+        return False
     
