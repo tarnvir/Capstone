@@ -10,177 +10,103 @@ from CybORG.Agents.SimpleAgents.PPO.ActorCritic import ActorCritic
 from CybORG.Agents.SimpleAgents.PPO.Memory import Memory
 
 class HybridBlueAgent:
-    def __init__(self, input_dim=52, hidden_dim=64, output_dim=140):
-        """Initialize Hybrid Blue Agent combining PPO with forced defensive sequences
-        Args:
-            input_dim: Size of observation space (default: 52)
-            hidden_dim: Size of hidden layers (default: 64)
-            output_dim: Size of action space (default: 140)
-        """
-        # Initialize device (GPU/CPU)
+    def __init__(self, input_dim=52, hidden_dim=256, output_dim=140):
+        """Initialize Hybrid Blue Agent with both PPO and DQN"""
+        # Initialize device
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # Initialize step counter for tracking episode progress
-        self.step_counter = 0
-        
-        # Initialize loss function for value network
-        self.MSE_loss = nn.MSELoss()
-        
-        # Minimum batch size for updates
-        self.min_batch_size = 32
-        
-        # Track action statistics for adaptive behavior
-        self.action_stats = {
-            'success_rate': {},           # Success rate per action
-            'reward_history': {},         # Historical rewards per action
-            'usage_count': {},            # How often each action is used
-            'last_success': {}            # When action was last successful
+        # Define decoy actions first
+        self.decoy_actions = {
+            'enterprise0': 69,
+            'enterprise1': 70,
+            'enterprise2': 71,
+            'opserver0': 72,
+            'user_hosts': [73, 74, 75, 76],
+            'defender': 77
         }
         
-        # Track system states and priorities
-        self.system_states = {
-            'enterprise0': {'compromised': False, 'success_rate': 0.0},
-            'enterprise1': {'compromised': False, 'success_rate': 0.0},
-            'enterprise2': {'compromised': False, 'success_rate': 0.0},
-            'opserver0': {'compromised': False, 'success_rate': 0.0}
-        }
-        
-        # System priority weights for decision making
-        self.system_priorities = {
-            'enterprise0': 0.5,  # High priority
-            'enterprise1': 0.3,
-            'enterprise2': 0.2,
-            'opserver0': 0.6    # Highest priority
-        }
-        
-        # Exploration parameters
-        self.exploration_params = {
-            'exploration_bonus': 0.2,     # Bonus for exploring new actions
-            'history_window': 50,         # Window for tracking history
-            'reward_threshold': -5.0      # Threshold for good performance
-        }
-        
-        # Initialize PPO networks
+        # Initialize PPO components
         self.policy = ActorCritic(input_dim, output_dim).to(self.device)
         self.old_policy = ActorCritic(input_dim, output_dim).to(self.device)
         self.old_policy.load_state_dict(self.policy.state_dict())
         
+        # Initialize DQN for decoy decisions
+        self.decoy_dqn = DQNAgent(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=len(self.decoy_actions)
+        )
+        
         # PPO hyperparameters
-        self.gamma = 0.99           # Discount factor
-        self.lr = 0.002            # Learning rate
-        self.betas = [0.9, 0.990]  # Adam optimizer parameters
-        self.K_epochs = 6          # Number of epochs per update
-        self.eps_clip = 0.2        # PPO clipping parameter
+        self.gamma = 0.97
+        self.gae_lambda = 0.95
+        self.eps_clip = 0.2
+        self.K_epochs = 10
+        self.entropy_coef = 0.3
+        self.lr = 5e-5
+        self.min_batch_size = 32
+        self.MSE_loss = nn.MSELoss()
         
-        # Initialize experience memory
-        self.memory = Memory()
-        
-        # Initialize action and reward history
-        self.actions = []          # Track actions taken
-        self.rewards = []          # Track rewards received
-        self.rewards_history = []  # Track all historical rewards
-        
-        # Initialize optimizer
+        # Initialize memory and optimizer
+        self.memory = Memory(buffer_size=2048)
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
             lr=self.lr,
-            betas=self.betas
+            eps=1e-5,
+            weight_decay=1e-6
         )
         
-        # Initialize last observation
+        # System priorities
+        self.system_priorities = {
+            'enterprise0': 0.4,
+            'enterprise1': 0.3,
+            'enterprise2': 0.2,
+            'opserver0': 0.1
+        }
+        
+        # Initialize tracking variables
+        self.step_counter = 0
+        self.actions = []
+        self.rewards = []
         self.last_observation = None
+        
+        # Initialize action statistics
+        self.action_stats = {
+            'reward_history': {},
+            'usage_count': {},
+            'success_rate': {},
+            'last_success': {}
+        }
     
     def get_action(self, observation, action_space):
-        """Get action using PPO with forced variety"""
+        """Enhanced action selection with specific counter-strategies"""
         state = torch.FloatTensor(observation).to(self.device)
         action_space = list(action_space) if not isinstance(action_space, list) else action_space
         
-        # Force action variety using a cycle-based approach
-        step_in_cycle = len(self.actions) % 3
-        
-        # First action in cycle: Monitor (but not always)
-        if step_in_cycle == 0:
-            if np.random.random() < 0.7:  # 70% chance to monitor
-                if 1 in action_space:
-                    return action_space.index(1)
-            else:  # 30% chance to do something else
-                available_actions = [a for a in action_space if a != 1]
-                if available_actions:
-                    return action_space.index(np.random.choice(available_actions))
-        
-        # Second action in cycle: Analyze
-        elif step_in_cycle == 1 and len(self.actions) > 0:
-            if self.actions[-1] == 1:  # If last action was Monitor
-                analyze_actions = [3, 4, 5, 9]
-                available_analyze = [a for a in analyze_actions if a in action_space]
-                if available_analyze:
-                    # Choose analyze target based on threat assessment
-                    threats = {
-                        3: sum(observation[0:4]),    # enterprise0
-                        4: sum(observation[4:8]),    # enterprise1
-                        5: sum(observation[8:12]),   # enterprise2
-                        9: sum(observation[28:32])   # opserver0
-                    }
-                    # Filter to available actions and add noise
-                    valid_threats = {a: threats[a] + np.random.normal(0, 0.1) 
-                                   for a in available_analyze}
-                    return action_space.index(max(valid_threats.items(), key=lambda x: x[1])[0])
-        
-        # Third action in cycle: Restore or Decoy
-        elif step_in_cycle == 2 and len(self.actions) > 1:
-            if self.actions[-2] == 1 and self.actions[-1] in [3,4,5,9]:
-                # Map analyze actions to corresponding restore/decoy actions
-                action_map = {
-                    3: [133, 69],  # Restore or Decoy for enterprise0
-                    4: [134, 70],  # Restore or Decoy for enterprise1
-                    5: [135, 71],  # Restore or Decoy for enterprise2
-                    9: [139, 72]   # Restore or Decoy for opserver0
-                }
-                possible_actions = action_map[self.actions[-1]]
-                available_actions = [a for a in possible_actions if a in action_space]
-                if available_actions:
-                    return action_space.index(np.random.choice(available_actions))
-        
-        # Use policy network with exploration
-        with torch.no_grad():
-            action_probs = self.policy.actor(state)
-            
-            # Create action mask
-            mask = torch.ones_like(action_probs)
-            for i, action in enumerate(action_space):
-                # Reduce probability of recent actions
-                if len(self.actions) > 0 and action in self.actions[-3:]:
-                    mask[i] *= 0.3
+        # First check if we should place decoy
+        if self._should_place_decoy(observation):
+            # Use DQN for decoy placement
+            with torch.no_grad():
+                decoy_values = self.decoy_dqn.q_network(observation)
+                # Convert tensor to numpy and get max index
+                decoy_values_np = decoy_values.cpu().numpy()
+                max_value_idx = np.argmax(decoy_values_np)
                 
-                # Boost important actions
-                if action == 1:  # Monitor
-                    mask[i] *= 1.5
-                elif action in [3,4,5,9]:  # Analyze
-                    mask[i] *= 1.3
-                elif action in [133,134,135,139]:  # Restore
-                    mask[i] *= 1.3
-                elif action in range(69, 78):  # Decoys
-                    mask[i] *= 1.2
-            
-            # Apply mask and add exploration noise
-            action_probs = action_probs * mask
-            noise = torch.randn_like(action_probs) * 0.2
-            action_probs = torch.softmax(action_probs + noise, dim=-1)
-            
-            # Sample action
-            dist = torch.distributions.Categorical(action_probs)
-            action_idx = dist.sample().item()
-            
-            # Store experience
-            self.memory.add(
-                state=state.detach(),
-                action=torch.tensor(action_idx),
-                logprob=dist.log_prob(torch.tensor(action_idx)).detach(),
-                reward=0,
-                is_terminal=False
-            )
-            
-            return action_idx
+                # Map index to decoy action
+                decoy_systems = ['enterprise0', 'enterprise1', 'enterprise2', 'opserver0', 'user_hosts', 'defender']
+                selected_system = decoy_systems[max_value_idx]
+                
+                if selected_system == 'user_hosts':
+                    # Randomly select one of the user host decoys
+                    decoy_action = np.random.choice(self.decoy_actions[selected_system])
+                else:
+                    decoy_action = self.decoy_actions[selected_system]
+                    
+                if decoy_action in action_space:
+                    return action_space.index(decoy_action)
+        
+        # Otherwise use PPO for normal actions
+        return self._get_ppo_action(observation, action_space)
     
     def _assess_threat(self, observation):
         """Enhanced threat assessment"""
@@ -398,7 +324,6 @@ class HybridBlueAgent:
         
         # Calculate returns and advantages
         returns = []
-        advantages = []
         discounted_reward = 0
         
         # Get value estimate for next state
@@ -407,19 +332,25 @@ class HybridBlueAgent:
                 torch.FloatTensor(next_state).to(self.device)
             ).detach()
         
-        # Calculate GAE and returns
-        for reward, is_terminal in zip(reversed(self.rewards), 
-                                     reversed([done] + [False] * (len(self.rewards)-1))):
-            if is_terminal:
+        # Calculate returns
+        for reward in reversed(self.rewards):
+            if done:
                 discounted_reward = 0
             discounted_reward = reward + (self.gamma * discounted_reward)
             returns.insert(0, discounted_reward)
         
-        # Convert to tensors
+        # Convert to tensors and ensure same size
         old_states = torch.stack(self.memory.states)
         old_actions = torch.stack(self.memory.actions)
         old_logprobs = torch.stack(self.memory.logprobs)
         returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+        
+        # Ensure all tensors have same batch dimension
+        batch_size = min(len(returns), len(old_states))
+        returns = returns[:batch_size]
+        old_states = old_states[:batch_size]
+        old_actions = old_actions[:batch_size]
+        old_logprobs = old_logprobs[:batch_size]
         
         # Normalize returns
         returns = (returns - returns.mean()) / (returns.std() + 1e-5)
@@ -459,4 +390,184 @@ class HybridBlueAgent:
         if done:
             self.actions = []
             self.rewards = []
+    
+    def _detect_bline_pattern(self, observation):
+        """Detect if B_lineAgent pattern is being used"""
+        if len(self.actions) < 3:
+            return False
+        
+        # B_line uses fixed sequence: Discover -> Exploit -> Privilege Escalate
+        # Check for typical B_line targets
+        targets = {
+            'User0': sum(observation[0:4]),
+            'Enterprise0': sum(observation[4:8]),
+            'Enterprise2': sum(observation[8:12]),
+            'Op_Server0': sum(observation[28:32])
+        }
+        
+        # High activity on these systems suggests B_line
+        return any(v > 0.5 for v in targets.values())
+
+    def _counter_bline_strategy(self, observation):
+        """Counter B_lineAgent's predictable path"""
+        # B_line's known path: User -> Enterprise -> Op_Server
+        critical_points = {
+            'User0': {'monitor': 1, 'analyze': 3, 'restore': 133, 'decoy': 69},
+            'Enterprise0': {'monitor': 1, 'analyze': 4, 'restore': 134, 'decoy': 70},
+            'Enterprise2': {'monitor': 1, 'analyze': 5, 'restore': 135, 'decoy': 71},
+            'Op_Server0': {'monitor': 1, 'analyze': 9, 'restore': 139, 'decoy': 72}
+        }
+        
+        # Check each critical point
+        for system, actions in critical_points.items():
+            threat_level = self._get_system_threat(observation, system)
+            if threat_level > 0.5:
+                # System under attack - respond
+                if len(self.actions) > 0:
+                    if self.actions[-1] == actions['monitor']:
+                        return actions['analyze']
+                    elif self.actions[-1] == actions['analyze']:
+                        # Randomly choose between restore and decoy
+                        return np.random.choice([actions['restore'], actions['decoy']])
+                return actions['monitor']
+        
+        return None
+
+    def _detect_meander_pattern(self, observation):
+        """Detect if RedMeanderAgent pattern is being used"""
+        if len(self.actions) < 5:
+            return False
+        
+        # Meander uses random exploration and opportunistic attacks
+        # Check for scattered activity
+        system_activity = {
+            'User0': sum(observation[0:4]),
+            'Enterprise0': sum(observation[4:8]),
+            'Enterprise1': sum(observation[8:12]),
+            'Enterprise2': sum(observation[12:16]),
+            'Op_Server0': sum(observation[28:32])
+        }
+        
+        # Multiple systems with medium activity suggests Meander
+        active_systems = sum(v > 0.3 for v in system_activity.values())
+        return active_systems >= 2
+
+    def _counter_meander_strategy(self, observation):
+        """Counter RedMeanderAgent's random behavior"""
+        # Deploy decoys more aggressively
+        if np.random.random() < 0.4:  # 40% chance to use decoys
+            active_systems = self._get_active_systems(observation)
+            if active_systems:
+                # Deploy decoy near most active system
+                system = max(active_systems.items(), key=lambda x: x[1])[0]
+                decoy_actions = {
+                    'User0': 69,
+                    'Enterprise0': 70,
+                    'Enterprise1': 71,
+                    'Enterprise2': 72,
+                    'Op_Server0': 73
+                }
+                return decoy_actions[system]
+        
+        # Regular defensive sequence
+        if len(self.actions) % 3 == 0:
+            return 1  # Monitor
+        elif len(self.actions) > 0 and self.actions[-1] == 1:
+            # Choose analyze based on threat
+            threats = {
+                3: sum(observation[0:4]),    # User0
+                4: sum(observation[4:8]),    # Enterprise0
+                5: sum(observation[8:12]),   # Enterprise1
+                9: sum(observation[28:32])   # Op_Server0
+            }
+            return max(threats.items(), key=lambda x: x[1])[0]
+        
+        return None
+
+    def _get_system_threat(self, observation, system):
+        """Get threat level for specific system"""
+        system_indices = {
+            'User0': slice(0, 4),
+            'Enterprise0': slice(4, 8),
+            'Enterprise1': slice(8, 12),
+            'Enterprise2': slice(12, 16),
+            'Op_Server0': slice(28, 32)
+        }
+        return sum(observation[system_indices[system]])
+
+    def _get_active_systems(self, observation):
+        """Get activity levels for all systems"""
+        return {
+            'User0': sum(observation[0:4]),
+            'Enterprise0': sum(observation[4:8]),
+            'Enterprise1': sum(observation[8:12]),
+            'Enterprise2': sum(observation[12:16]),
+            'Op_Server0': sum(observation[28:32])
+        }
+    
+    def _should_place_decoy(self, observation):
+        """Determine if we should place a decoy based on:
+        1. Threat level
+        2. Existing decoys
+        3. System vulnerabilities
+        """
+        threat_level = self._assess_threat(observation)
+        return threat_level > 0.5 or np.random.random() < 0.2  # 20% random decoy placement
+    
+    def store_decoy_experience(self, state, action, reward, next_state, done):
+        """Store decoy-related experiences separately"""
+        if action in self.decoy_actions.values():
+            self.decoy_dqn.replay_buffer.push(
+                state, action, reward, next_state, done
+            )
+    
+    def _get_ppo_action(self, observation, action_space):
+        """Get action using PPO policy
+        Args:
+            observation: Current state observation
+            action_space: List of available actions
+        Returns:
+            int: Index of chosen action
+        """
+        state = torch.FloatTensor(observation).to(self.device)
+        
+        with torch.no_grad():
+            action_probs = self.policy.actor(state)
+            
+            # Create action mask
+            mask = torch.ones_like(action_probs)
+            for i, action in enumerate(action_space):
+                # Boost important actions based on context
+                if action == 1:  # monitor
+                    mask[i] *= 2.0
+                elif action in [3,4,5,9]:  # analyze
+                    mask[i] *= 1.5
+                elif action in [133,134,135,139]:  # restore
+                    mask[i] *= 1.5
+                elif action in range(69, 78):  # decoys
+                    mask[i] *= 1.2
+                
+                # Reduce probability of recent actions
+                if len(self.actions) > 0 and action in self.actions[-3:]:
+                    mask[i] *= 0.5
+            
+            # Apply mask and add exploration noise
+            action_probs = action_probs * mask
+            noise = torch.randn_like(action_probs) * 0.2
+            action_probs = torch.softmax(action_probs + noise, dim=-1)
+            
+            # Sample action
+            dist = torch.distributions.Categorical(action_probs)
+            action_idx = dist.sample().item()
+            
+            # Store experience
+            self.memory.add(
+                state=state.detach(),
+                action=torch.tensor(action_idx),
+                logprob=dist.log_prob(torch.tensor(action_idx)).detach(),
+                reward=0,
+                is_terminal=False
+            )
+            
+            return action_idx
     
