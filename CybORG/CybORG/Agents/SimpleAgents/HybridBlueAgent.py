@@ -86,37 +86,86 @@ class HybridBlueAgent:
             lr=self.lr,
             betas=self.betas
         )
+        
+        # Initialize last observation
+        self.last_observation = None
     
     def get_action(self, observation, action_space):
-        """Get action using PPO with forced defensive sequences
-        Args:
-            observation: Current environment state
-            action_space: List of available actions
-        Returns:
-            int: Index of chosen action
-        """
+        """Get action using PPO with forced variety"""
         state = torch.FloatTensor(observation).to(self.device)
+        action_space = list(action_space) if not isinstance(action_space, list) else action_space
         
-        # Force exploration with 30% probability
-        if np.random.random() < 0.3:
-            return np.random.randint(len(action_space))
+        # Force action variety using a cycle-based approach
+        step_in_cycle = len(self.actions) % 3
         
-        # Force monitor periodically
-        if len(self.actions) % 3 == 0 and 1 in action_space:
-            return action_space.index(1)
+        # First action in cycle: Monitor (but not always)
+        if step_in_cycle == 0:
+            if np.random.random() < 0.7:  # 70% chance to monitor
+                if 1 in action_space:
+                    return action_space.index(1)
+            else:  # 30% chance to do something else
+                available_actions = [a for a in action_space if a != 1]
+                if available_actions:
+                    return action_space.index(np.random.choice(available_actions))
         
-        # Use policy network for action selection
+        # Second action in cycle: Analyze
+        elif step_in_cycle == 1 and len(self.actions) > 0:
+            if self.actions[-1] == 1:  # If last action was Monitor
+                analyze_actions = [3, 4, 5, 9]
+                available_analyze = [a for a in analyze_actions if a in action_space]
+                if available_analyze:
+                    # Choose analyze target based on threat assessment
+                    threats = {
+                        3: sum(observation[0:4]),    # enterprise0
+                        4: sum(observation[4:8]),    # enterprise1
+                        5: sum(observation[8:12]),   # enterprise2
+                        9: sum(observation[28:32])   # opserver0
+                    }
+                    # Filter to available actions and add noise
+                    valid_threats = {a: threats[a] + np.random.normal(0, 0.1) 
+                                   for a in available_analyze}
+                    return action_space.index(max(valid_threats.items(), key=lambda x: x[1])[0])
+        
+        # Third action in cycle: Restore or Decoy
+        elif step_in_cycle == 2 and len(self.actions) > 1:
+            if self.actions[-2] == 1 and self.actions[-1] in [3,4,5,9]:
+                # Map analyze actions to corresponding restore/decoy actions
+                action_map = {
+                    3: [133, 69],  # Restore or Decoy for enterprise0
+                    4: [134, 70],  # Restore or Decoy for enterprise1
+                    5: [135, 71],  # Restore or Decoy for enterprise2
+                    9: [139, 72]   # Restore or Decoy for opserver0
+                }
+                possible_actions = action_map[self.actions[-1]]
+                available_actions = [a for a in possible_actions if a in action_space]
+                if available_actions:
+                    return action_space.index(np.random.choice(available_actions))
+        
+        # Use policy network with exploration
         with torch.no_grad():
             action_probs = self.policy.actor(state)
             
             # Create action mask
-            mask = torch.zeros_like(action_probs)
+            mask = torch.ones_like(action_probs)
             for i, action in enumerate(action_space):
-                mask[i] = 1.0
+                # Reduce probability of recent actions
+                if len(self.actions) > 0 and action in self.actions[-3:]:
+                    mask[i] *= 0.3
+                
+                # Boost important actions
+                if action == 1:  # Monitor
+                    mask[i] *= 1.5
+                elif action in [3,4,5,9]:  # Analyze
+                    mask[i] *= 1.3
+                elif action in [133,134,135,139]:  # Restore
+                    mask[i] *= 1.3
+                elif action in range(69, 78):  # Decoys
+                    mask[i] *= 1.2
             
-            # Apply mask and normalize
+            # Apply mask and add exploration noise
             action_probs = action_probs * mask
-            action_probs = action_probs / (action_probs.sum() + 1e-8)
+            noise = torch.randn_like(action_probs) * 0.2
+            action_probs = torch.softmax(action_probs + noise, dim=-1)
             
             # Sample action
             dist = torch.distributions.Categorical(action_probs)
@@ -133,48 +182,281 @@ class HybridBlueAgent:
             
             return action_idx
     
-    def _shape_reward(self, reward):
-        """Shape reward to encourage defensive sequences
+    def _assess_threat(self, observation):
+        """Enhanced threat assessment"""
+        # System-specific threat assessment
+        threats = {
+            'enterprise0': sum(observation[0:4]),
+            'enterprise1': sum(observation[4:8]),
+            'enterprise2': sum(observation[8:12]),
+            'opserver0': sum(observation[28:32])
+        }
+        
+        # Weight threats by system priority
+        weighted_threats = {
+            system: threat * self.system_priorities[system]
+            for system, threat in threats.items()
+        }
+        
+        # Calculate overall threat metrics
+        max_threat = max(weighted_threats.values())
+        avg_threat = sum(weighted_threats.values()) / len(weighted_threats)
+        
+        # Combine metrics with emphasis on maximum threat
+        return 0.7 * max_threat + 0.3 * avg_threat
+    
+    def _get_priority_target(self, observation):
+        """Determine highest priority target based on threats
         Args:
-            reward: Original reward from environment
+            observation: Current state observation
         Returns:
-            float: Shaped reward
+            str: Name of highest priority target
         """
+        threats = {
+            'enterprise0': sum(observation[0:4]),
+            'enterprise1': sum(observation[4:8]),
+            'enterprise2': sum(observation[8:12]),
+            'opserver0': sum(observation[28:32])
+        }
+        
+        # Weight threats by system priority
+        weighted_threats = {
+            system: threat * self.system_priorities[system]
+            for system, threat in threats.items()
+        }
+        
+        return max(weighted_threats.items(), key=lambda x: x[1])[0]
+    
+    def _shape_reward(self, reward):
+        """Enhanced reward shaping with better incentives and penalties"""
         shaped_reward = reward
         
-        # Stronger penalties for negative rewards
+        # Base reward scaling
         if reward < 0:
-            shaped_reward *= 3.0
+            shaped_reward *= 2.0  # Reduced penalty multiplier to avoid too negative rewards
         
-        # Huge bonus for complete sequences
-        if len(self.actions) >= 3:
-            if self._is_valid_sequence(self.actions[-3:]):
-                shaped_reward += 200.0
+        # Get current state assessment
+        threat_level = self._assess_threat(self.last_observation)
         
-        # Progressive rewards for improvement
-        if len(self.rewards) > 0:
-            if shaped_reward > self.rewards[-1]:
-                shaped_reward *= 1.5
+        # Get last action (if any)
+        last_action = None
+        if len(self.actions) > 0:
+            last_action = self.actions[-1]
+            
+            # Reward for successful defensive actions
+            if last_action == 1 and threat_level > 0.3:
+                shaped_reward += 50.0  # Bonus for detecting threats
+                
+            # Reward for Analyze actions that follow Monitor
+            if last_action in [3,4,5,9] and len(self.actions) > 1 and self.actions[-2] == 1:
+                shaped_reward += 75.0  # Higher bonus for proper sequence
+                
+            # Reward for Restore/Remove actions that follow Analyze
+            if last_action in [133,134,135,139] and len(self.actions) > 1 and self.actions[-2] in [3,4,5,9]:
+                shaped_reward += 100.0  # Highest bonus for completing sequence
+                
+            # Reward for decoy actions
+            if last_action in range(69, 78):  # Decoy actions
+                if threat_level > 0.5:  # Higher threat level
+                    shaped_reward += 150.0  # Large bonus for deploying decoys when needed
+                else:
+                    shaped_reward += 25.0  # Smaller bonus for proactive decoys
+            
+            # Penalty for resource wastage
+            if len(self.actions) >= 3:
+                recent_actions = self.actions[-3:]
+                if len(set(recent_actions)) == 1:  # Same action repeated 3 times
+                    shaped_reward -= 50.0  # Penalty for wasteful repetition
+            
+            # Track success/failure for adaptive learning
+            if last_action not in self.action_stats['reward_history']:
+                self.action_stats['reward_history'][last_action] = []
+            self.action_stats['reward_history'][last_action].append(shaped_reward)
+            
+            # Update success rate
+            recent_rewards = self.action_stats['reward_history'][last_action][-100:]
+            success_rate = sum(r > 0 for r in recent_rewards) / len(recent_rewards)
+            self.action_stats['success_rate'][last_action] = success_rate
         
         return shaped_reward
     
     def _is_valid_sequence(self, sequence):
-        """Check if action sequence is valid (Monitor -> Analyze -> Restore)
-        Args:
-            sequence: List of last 3 actions
-        Returns:
-            bool: True if sequence is valid
-        """
+        """Check if action sequence is valid"""
         if len(sequence) < 3:
             return False
         
-        # Define valid sequences
+        # Define valid sequences including decoys
         valid_sequences = {
             (1, 3, 133),  # Monitor -> Analyze E0 -> Restore E0
             (1, 4, 134),  # Monitor -> Analyze E1 -> Restore E1
             (1, 5, 135),  # Monitor -> Analyze E2 -> Restore E2
             (1, 9, 139),  # Monitor -> Analyze Op -> Restore Op
+            # Add decoy sequences
+            (1, 3, 69),   # Monitor -> Analyze E0 -> Deploy Decoy E0
+            (1, 4, 70),   # Monitor -> Analyze E1 -> Deploy Decoy E1
+            (1, 5, 71),   # Monitor -> Analyze E2 -> Deploy Decoy E2
+            (1, 9, 72),   # Monitor -> Analyze Op -> Deploy Decoy Op
         }
         
         return tuple(sequence) in valid_sequences
+    
+    def save(self, path):
+        """Save model and training state
+        Args:
+            path: Path to save checkpoint
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Save only essential model components
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'old_policy_state_dict': self.old_policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'step_counter': self.step_counter,
+            'hyperparameters': {
+                'gamma': self.gamma,
+                'lr': self.lr,
+                'eps_clip': self.eps_clip,
+                'K_epochs': self.K_epochs
+            }
+        }, path)
+
+    def load(self, path):
+        """Load model and training state
+        Args:
+            path: Path to checkpoint file
+        """
+        # Load checkpoint
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Load network states
+        self.policy.load_state_dict(checkpoint['policy_state_dict'])
+        self.old_policy.load_state_dict(checkpoint['old_policy_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load step counter if exists
+        if 'step_counter' in checkpoint:
+            self.step_counter = checkpoint['step_counter']
+        
+        # Load hyperparameters if exist
+        if 'hyperparameters' in checkpoint:
+            hyperparameters = checkpoint['hyperparameters']
+            self.gamma = hyperparameters.get('gamma', self.gamma)
+            self.lr = hyperparameters.get('lr', self.lr)
+            self.eps_clip = hyperparameters.get('eps_clip', self.eps_clip)
+            self.K_epochs = hyperparameters.get('K_epochs', self.K_epochs)
+    
+    def store_reward(self, reward, observation=None):
+        """Store and shape reward for learning
+        Args:
+            reward: Raw reward from environment
+            observation: Current observation (optional)
+        """
+        # Update last observation if provided
+        if observation is not None:
+            self.last_observation = observation
+        
+        # Shape the reward
+        shaped_reward = self._shape_reward(reward)
+        
+        # Store reward
+        self.rewards.append(shaped_reward)
+        
+        # Update action statistics
+        if len(self.actions) > 0:
+            last_action = self.actions[-1]
+            
+            # Update reward history for this action
+            if last_action not in self.action_stats['reward_history']:
+                self.action_stats['reward_history'][last_action] = []
+            self.action_stats['reward_history'][last_action].append(shaped_reward)
+            
+            # Update usage count
+            if last_action not in self.action_stats['usage_count']:
+                self.action_stats['usage_count'][last_action] = 0
+            self.action_stats['usage_count'][last_action] += 1
+            
+            # Update success rate
+            rewards = self.action_stats['reward_history'][last_action][-100:]  # Last 100 rewards
+            success_rate = sum(r > 0 for r in rewards) / len(rewards)
+            self.action_stats['success_rate'][last_action] = success_rate
+            
+            # Update last success
+            if shaped_reward > 0:
+                self.action_stats['last_success'][last_action] = self.step_counter
+    
+    def update(self, next_state, done):
+        """Update policy using PPO
+        Args:
+            next_state: Next environment state
+            done: Whether episode is done
+        """
+        # Only update if we have enough experiences
+        if len(self.memory.states) < self.min_batch_size:
+            return
+        
+        # Calculate returns and advantages
+        returns = []
+        advantages = []
+        discounted_reward = 0
+        
+        # Get value estimate for next state
+        with torch.no_grad():
+            next_value = self.policy.critic(
+                torch.FloatTensor(next_state).to(self.device)
+            ).detach()
+        
+        # Calculate GAE and returns
+        for reward, is_terminal in zip(reversed(self.rewards), 
+                                     reversed([done] + [False] * (len(self.rewards)-1))):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            returns.insert(0, discounted_reward)
+        
+        # Convert to tensors
+        old_states = torch.stack(self.memory.states)
+        old_actions = torch.stack(self.memory.actions)
+        old_logprobs = torch.stack(self.memory.logprobs)
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+        
+        # Normalize returns
+        returns = (returns - returns.mean()) / (returns.std() + 1e-5)
+        
+        # Update policy for K epochs
+        for _ in range(self.K_epochs):
+            # Get current policy outputs
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            
+            # Calculate advantages
+            advantages = returns - state_values.detach()
+            
+            # Calculate ratios and surrogate losses
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            
+            # Calculate final loss
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = 0.5 * self.MSE_loss(state_values, returns)
+            entropy_loss = -0.01 * dist_entropy.mean()
+            
+            total_loss = policy_loss + value_loss + entropy_loss
+            
+            # Update network
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            self.optimizer.step()
+        
+        # Copy new weights into old policy
+        self.old_policy.load_state_dict(self.policy.state_dict())
+        
+        # Clear memory buffer
+        self.memory.clear_memory()
+        
+        # Reset episode-specific variables if done
+        if done:
+            self.actions = []
+            self.rewards = []
     

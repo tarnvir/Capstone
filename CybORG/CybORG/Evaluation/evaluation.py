@@ -29,14 +29,18 @@ if __name__ == "__main__":
     # Define action space first
     action_space = [
         1,                    # monitor
-        133, 134, 135, 139,  # restore actions
-        3, 4, 5, 9,          # analyse actions
-        16, 17, 18, 22,      # remove actions
-        11, 12, 13, 14,      # analyse user hosts
-        141, 142, 143, 144,  # restore user hosts
-        132,                 # restore defender
-        2,                   # analyse defender
-        15, 24, 25, 26, 27   # remove defender and user hosts
+        133, 134, 135, 139,  # restore actions for enterprise and opserver
+        3, 4, 5, 9,          # analyse actions for enterprise and opserver
+        16, 17, 18, 22,      # remove malware from enterprise and opserver
+        11, 12, 13, 14,      # analyse actions for user hosts
+        141, 142, 143, 144,  # restore actions for user hosts
+        132,                 # restore defender system
+        2,                   # analyse defender system
+        15, 24, 25, 26, 27,  # remove malware from defender and user hosts
+        # Add decoy actions
+        69, 70, 71, 72,      # Deploy decoy on enterprise0-2 and opserver0
+        73, 74, 75, 76,      # Deploy decoy on user hosts
+        77                   # Deploy decoy on defender
     ]
 
     # Initialize agent with proper dimensions

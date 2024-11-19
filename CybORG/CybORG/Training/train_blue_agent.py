@@ -25,7 +25,7 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
         
         # Define all possible actions for blue agent
         action_space = [
-            1,                    # monitor - basic system monitoring
+            1,                    # monitor
             133, 134, 135, 139,  # restore actions for enterprise and opserver
             3, 4, 5, 9,          # analyse actions for enterprise and opserver
             16, 17, 18, 22,      # remove malware from enterprise and opserver
@@ -33,7 +33,11 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
             141, 142, 143, 144,  # restore actions for user hosts
             132,                 # restore defender system
             2,                   # analyse defender system
-            15, 24, 25, 26, 27   # remove malware from defender and user hosts
+            15, 24, 25, 26, 27,  # remove malware from defender and user hosts
+            # Add decoy actions
+            69, 70, 71, 72,      # Deploy decoy on enterprise0-2 and opserver0
+            73, 74, 75, 76,      # Deploy decoy on user hosts
+            77                   # Deploy decoy on defender
         ]
         
         # Initialize hybrid blue agent with proper dimensions
@@ -67,8 +71,8 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
                 
                 # Take step in environment
                 next_observation, reward, done, _ = env.step(action)
-                # Store reward
-                hybrid_agent.store_reward(reward)
+                # Store reward with current observation
+                hybrid_agent.store_reward(reward, observation)
                 episode_reward += reward
                 
                 # Break if episode is done
