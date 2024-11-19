@@ -40,10 +40,10 @@ class HybridBlueAgent:
         }
         
         self.system_priorities = {
-            'enterprise0': 0.4,  # Highest
+            'enterprise0': 0.5,  # Increased priority
             'enterprise1': 0.3,
             'enterprise2': 0.2,
-            'opserver0': 0.1    # Lowest
+            'opserver0': 0.6    # Much higher priority
         }
         
         # Initialize exploration parameters
@@ -138,8 +138,14 @@ class HybridBlueAgent:
         }
     
     def get_action(self, observation, action_space):
+        self.step_counter += 1  # Track steps
         state = torch.FloatTensor(observation).to(self.device)
         action_space = list(action_space) if not isinstance(action_space, list) else action_space
+        
+        # Force early monitoring
+        if self.step_counter < 10 and 1 in action_space:
+            self.actions.append(1)
+            return action_space.index(1)
         
         # Force exploration with 15% probability
         if np.random.random() < 0.15:
@@ -519,9 +525,9 @@ class HybridBlueAgent:
         """Shape reward to encourage defensive sequences"""
         shaped_reward = reward
         
-        # Stronger penalties for negative rewards
+        # Scale penalties based on episode length
         if reward < 0:
-            shaped_reward *= 5.0
+            shaped_reward *= min(3.0, 1.0 + self.step_counter/100)
         
         # Reward for completing defensive sequences
         if len(self.actions) >= 3:
@@ -534,9 +540,9 @@ class HybridBlueAgent:
                 
                 # Higher bonus for critical systems
                 if last_three[1] in [3,4,5]:  # Enterprise
-                    shaped_reward += 50.0  # Significantly increased bonus
+                    shaped_reward += 50.0 * (1.0 + self.step_counter/200)  # Scale with episode length
                 elif last_three[1] == 9:  # Opserver
-                    shaped_reward += 75.0  # Even higher for opserver
+                    shaped_reward += 75.0 * (1.0 + self.step_counter/200)  # Scale with episode length
                 
                 # Quick response bonus
                 steps_since_monitor = len(self.actions) - self.actions.index(1)
@@ -546,7 +552,7 @@ class HybridBlueAgent:
         # Penalty for redundant actions
         if len(self.actions) >= 2:
             if self.actions[-1] == self.actions[-2]:
-                shaped_reward -= 5.0  # Penalty for repeating actions
+                shaped_reward -= 5.0 * (1.0 + self.step_counter/300)  # Scale penalty with episode length
         
         return shaped_reward
     
@@ -686,4 +692,17 @@ class HybridBlueAgent:
             risks[system] = base_risk * priority
         
         return risks
+    
+    def end_episode(self):
+        """Clean up at the end of an episode"""
+        # Reset episode-specific variables
+        self.actions = []
+        self.rewards = []
+        
+        # Clear memory buffer
+        self.memory.clear_memory()
+        
+        # Reset any episode-specific states
+        for system in self.system_states:
+            self.system_states[system]['compromised'] = False
     
