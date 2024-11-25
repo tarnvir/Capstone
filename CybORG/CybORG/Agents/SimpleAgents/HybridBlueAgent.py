@@ -10,12 +10,30 @@ from CybORG.Agents.SimpleAgents.PPO.ActorCritic import ActorCritic
 from CybORG.Agents.SimpleAgents.PPO.Memory import Memory
 
 class HybridBlueAgent:
-    def __init__(self, input_dim=52, hidden_dim=256, output_dim=140):
-        """Initialize Hybrid Blue Agent with both PPO and DQN"""
-        # Initialize device
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    def __init__(self, input_dim=52, hidden_dim=64, output_dim=41, lr=0.0005):
+        # Original PPO hyperparameters
+        self.eps = 0.9
+        self.eps_decay = 0.003
+        self.eps_min = 0.1
+        self.gamma = 0.99
+        self.K_epochs = 4
+        self.eps_clip = 0.2
+        self.action_std = 0.5
         
-        # Define decoy actions first
+        # Add GPU support
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        
+        # Initialize networks and move to device (only once)
+        self.policy = ActorCritic(input_dim, output_dim).to(self.device)
+        self.policy_old = ActorCritic(input_dim, output_dim).to(self.device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        # Original tracking variables
+        self.actions = []
+        self.action_stats = defaultdict(int)
+        
+        # Original decoy actions
         self.decoy_actions = {
             'enterprise0': 69,
             'enterprise1': 70,
@@ -24,11 +42,6 @@ class HybridBlueAgent:
             'user_hosts': [73, 74, 75, 76],
             'defender': 77
         }
-        
-        # Initialize PPO components
-        self.policy = ActorCritic(input_dim, output_dim).to(self.device)
-        self.old_policy = ActorCritic(input_dim, output_dim).to(self.device)
-        self.old_policy.load_state_dict(self.policy.state_dict())
         
         # Initialize DQN for decoy decisions
         self.decoy_dqn = DQNAgent(
@@ -64,13 +77,12 @@ class HybridBlueAgent:
             'opserver0': 0.1
         }
         
-        # Initialize tracking variables
+        # Original tracking variables
         self.step_counter = 0
-        self.actions = []
         self.rewards = []
         self.last_observation = None
         
-        # Initialize action statistics
+        # Original action statistics
         self.action_stats = {
             'reward_history': {},
             'usage_count': {},
@@ -227,51 +239,31 @@ class HybridBlueAgent:
         return tuple(sequence) in valid_sequences
     
     def save(self, path):
-        """Save model and training state
-        Args:
-            path: Path to save checkpoint
-        """
-        # Create directory if it doesn't exist
+        """Save model checkpoint"""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        # Save only essential model components
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
-            'old_policy_state_dict': self.old_policy.state_dict(),
+            'old_policy_state_dict': self.policy_old.state_dict(),  # Keep both names for compatibility
+            'policy_old_state_dict': self.policy_old.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'step_counter': self.step_counter,
-            'hyperparameters': {
-                'gamma': self.gamma,
-                'lr': self.lr,
-                'eps_clip': self.eps_clip,
-                'K_epochs': self.K_epochs
-            }
         }, path)
 
     def load(self, path):
-        """Load model and training state
-        Args:
-            path: Path to checkpoint file
-        """
-        # Load checkpoint
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        # Load network states
+        """Load model checkpoint with backwards compatibility"""
+        checkpoint = torch.load(path)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        self.old_policy.load_state_dict(checkpoint['old_policy_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # Load step counter if exists
-        if 'step_counter' in checkpoint:
-            self.step_counter = checkpoint['step_counter']
+        # Try different possible keys for old policy state dict
+        if 'policy_old_state_dict' in checkpoint:
+            self.policy_old.load_state_dict(checkpoint['policy_old_state_dict'])
+        elif 'old_policy_state_dict' in checkpoint:
+            self.policy_old.load_state_dict(checkpoint['old_policy_state_dict'])
+        else:
+            print("Warning: No old policy state found in checkpoint, copying from current policy")
+            self.policy_old.load_state_dict(self.policy.state_dict())
         
-        # Load hyperparameters if exist
-        if 'hyperparameters' in checkpoint:
-            hyperparameters = checkpoint['hyperparameters']
-            self.gamma = hyperparameters.get('gamma', self.gamma)
-            self.lr = hyperparameters.get('lr', self.lr)
-            self.eps_clip = hyperparameters.get('eps_clip', self.eps_clip)
-            self.K_epochs = hyperparameters.get('K_epochs', self.K_epochs)
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
     def store_reward(self, reward, observation=None):
         """Store and shape reward for learning
@@ -312,84 +304,108 @@ class HybridBlueAgent:
             if shaped_reward > 0:
                 self.action_stats['last_success'][last_action] = self.step_counter
     
-    def update(self, next_state, done):
-        """Update policy using PPO
-        Args:
-            next_state: Next environment state
-            done: Whether episode is done
-        """
-        # Only update if we have enough experiences
-        if len(self.memory.states) < self.min_batch_size:
-            return
+    def update(self, next_observation, done):
+        """Update agent's policy"""
+        # Store transition if we have a previous action
+        if len(self.actions) > 0 and len(self.rewards) > 0:
+            # Convert observations to float tensors
+            if isinstance(self.last_observation, np.ndarray):
+                state = self.last_observation
+            else:
+                state = np.array(self.last_observation, dtype=np.float32)
+                
+            if isinstance(next_observation, np.ndarray):
+                next_state = next_observation
+            else:
+                next_state = np.array(next_observation, dtype=np.float32)
+                
+            # Store experience
+            self.memory.states.append(state)
+            self.memory.actions.append(self.actions[-1])
+            self.memory.rewards.append(self.rewards[-1])
+            self.memory.next_states.append(next_state)
+            self.memory.dones.append(done)
+
+        # Update policy if enough samples
+        if len(self.memory.states) >= self.min_batch_size:
+            try:
+                # Convert to tensors
+                states = torch.FloatTensor(np.array(self.memory.states)).to(self.device)
+                actions = torch.LongTensor(self.memory.actions).to(self.device)
+                rewards = torch.FloatTensor(self.memory.rewards).to(self.device)
+                next_states = torch.FloatTensor(np.array(self.memory.next_states)).to(self.device)
+                dones = torch.FloatTensor(self.memory.dones).to(self.device)
+
+                # Compute returns with GAE
+                advantages = []
+                gae = 0
+                with torch.no_grad():
+                    _, next_values = self.policy(next_states)
+                    _, values = self.policy(states)
+                    next_values = next_values.squeeze()
+                    values = values.squeeze()
+                    
+                for t in reversed(range(len(rewards))):
+                    if t == len(rewards) - 1:
+                        next_value = next_values[t] * (1 - dones[t])
+                    else:
+                        next_value = values[t + 1]
+                        
+                    delta = rewards[t] + self.gamma * next_value - values[t]
+                    gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
+                    advantages.insert(0, gae)
+                    
+                advantages = torch.FloatTensor(advantages).to(self.device)
+                returns = advantages + values
+                
+                # Normalize advantages
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                # Get old action probabilities
+                old_probs, _ = self.policy_old(states)
+                old_probs = old_probs.detach()
+                
+                # Update policy for K epochs
+                for _ in range(self.K_epochs):
+                    # Get current action probabilities and state values
+                    probs, state_values = self.policy(states)
+                    dist = torch.distributions.Categorical(probs)
+                    
+                    # Compute ratio and surrogate loss
+                    new_probs = dist.log_prob(actions)
+                    old_probs_log = torch.log(old_probs.gather(1, actions.unsqueeze(1)).squeeze())
+                    ratio = torch.exp(new_probs - old_probs_log)
+                    
+                    # Compute actor and critic losses
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * advantages
+                    actor_loss = -torch.min(surr1, surr2).mean()
+                    critic_loss = self.MSE_loss(state_values.squeeze(), returns)
+                    
+                    # Add entropy bonus for exploration
+                    entropy_loss = -self.entropy_coef * dist.entropy().mean()
+                    
+                    # Total loss
+                    loss = actor_loss + 0.5 * critic_loss + entropy_loss
+                    
+                    # Update policy
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                
+                # Copy new weights into old policy
+                self.policy_old.load_state_dict(self.policy.state_dict())
+                
+                # Clear memory
+                self.memory.clear()
+                
+            except Exception as e:
+                print(f"Error in policy update: {str(e)}")
+                self.memory.clear()
         
-        # Calculate returns and advantages
-        returns = []
-        discounted_reward = 0
-        
-        # Get value estimate for next state
-        with torch.no_grad():
-            next_value = self.policy.critic(
-                torch.FloatTensor(next_state).to(self.device)
-            ).detach()
-        
-        # Calculate returns
-        for reward in reversed(self.rewards):
-            if done:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            returns.insert(0, discounted_reward)
-        
-        # Convert to tensors and ensure same size
-        old_states = torch.stack(self.memory.states)
-        old_actions = torch.stack(self.memory.actions)
-        old_logprobs = torch.stack(self.memory.logprobs)
-        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
-        
-        # Ensure all tensors have same batch dimension
-        batch_size = min(len(returns), len(old_states))
-        returns = returns[:batch_size]
-        old_states = old_states[:batch_size]
-        old_actions = old_actions[:batch_size]
-        old_logprobs = old_logprobs[:batch_size]
-        
-        # Normalize returns
-        returns = (returns - returns.mean()) / (returns.std() + 1e-5)
-        
-        # Update policy for K epochs
-        for _ in range(self.K_epochs):
-            # Get current policy outputs
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
-            
-            # Calculate advantages
-            advantages = returns - state_values.detach()
-            
-            # Calculate ratios and surrogate losses
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
-            
-            # Calculate final loss
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = 0.5 * self.MSE_loss(state_values, returns)
-            entropy_loss = -0.01 * dist_entropy.mean()
-            
-            total_loss = policy_loss + value_loss + entropy_loss
-            
-            # Update network
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            self.optimizer.step()
-        
-        # Copy new weights into old policy
-        self.old_policy.load_state_dict(self.policy.state_dict())
-        
-        # Clear memory buffer
-        self.memory.clear_memory()
-        
-        # Reset episode-specific variables if done
-        if done:
-            self.actions = []
-            self.rewards = []
+        # Update last observation
+        self.last_observation = next_observation
+        self.step_counter += 1
     
     def _detect_bline_pattern(self, observation):
         """Detect if B_lineAgent pattern is being used"""
@@ -408,28 +424,60 @@ class HybridBlueAgent:
         # High activity on these systems suggests B_line
         return any(v > 0.5 for v in targets.values())
 
-    def _counter_bline_strategy(self, observation):
-        """Counter B_lineAgent's predictable path"""
-        # B_line's known path: User -> Enterprise -> Op_Server
-        critical_points = {
-            'User0': {'monitor': 1, 'analyze': 3, 'restore': 133, 'decoy': 69},
-            'Enterprise0': {'monitor': 1, 'analyze': 4, 'restore': 134, 'decoy': 70},
-            'Enterprise2': {'monitor': 1, 'analyze': 5, 'restore': 135, 'decoy': 71},
-            'Op_Server0': {'monitor': 1, 'analyze': 9, 'restore': 139, 'decoy': 72}
-        }
+    def _counter_bline(self, observation, action_space):
+        """Enhanced B_line counter strategy"""
+        # B_line's exact attack sequence
+        attack_sequence = [
+            ('User0', 3, 133, 69),       # system, analyze, restore, decoy
+            ('Enterprise0', 4, 134, 70),  # B_line's second target
+            ('Enterprise2', 5, 135, 71),  # B_line's third target
+            ('Op_Server0', 9, 139, 72)    # Final target
+        ]
         
-        # Check each critical point
-        for system, actions in critical_points.items():
-            threat_level = self._get_system_threat(observation, system)
-            if threat_level > 0.5:
-                # System under attack - respond
-                if len(self.actions) > 0:
-                    if self.actions[-1] == actions['monitor']:
-                        return actions['analyze']
-                    elif self.actions[-1] == actions['analyze']:
-                        # Randomly choose between restore and decoy
-                        return np.random.choice([actions['restore'], actions['decoy']])
-                return actions['monitor']
+        # Always monitor if we haven't in last 2 steps
+        if len(self.actions) >= 2 and 1 not in self.actions[-2:]:
+            if 1 in action_space:
+                return action_space.index(1)
+        
+        # Get current position in B_line's attack path
+        current_position = -1
+        max_threat = 0
+        for i, (system, _, _, _) in enumerate(attack_sequence):
+            threat = self._get_system_threat(observation, system)
+            if threat > max_threat:
+                max_threat = threat
+                current_position = i
+                
+        # If we detect activity, defend aggressively
+        if current_position != -1:
+            # Immediately restore current system if compromised
+            _, analyze, restore, decoy = attack_sequence[current_position]
+            if restore in action_space:
+                return action_space.index(restore)
+                
+            # Place decoy on next system in path
+            next_pos = (current_position + 1) % len(attack_sequence)
+            _, _, _, next_decoy = attack_sequence[next_pos]
+            if next_decoy in action_space:
+                return action_space.index(next_decoy)
+                
+            # Analyze current system
+            if analyze in action_space:
+                return action_space.index(analyze)
+        
+        # Proactively defend the path
+        for i in range(len(attack_sequence)):
+            # Check two steps ahead of last known activity
+            defend_pos = (current_position + i + 1) % len(attack_sequence)
+            _, analyze, restore, decoy = attack_sequence[defend_pos]
+            
+            # Proactive defense sequence
+            if analyze in action_space:
+                return action_space.index(analyze)
+            if decoy in action_space:
+                return action_space.index(decoy)
+            if restore in action_space:
+                return action_space.index(restore)
         
         return None
 
@@ -486,6 +534,7 @@ class HybridBlueAgent:
 
     def _get_system_threat(self, observation, system):
         """Get threat level for specific system"""
+        # System-specific observation indices
         system_indices = {
             'User0': slice(0, 4),
             'Enterprise0': slice(4, 8),
@@ -493,7 +542,25 @@ class HybridBlueAgent:
             'Enterprise2': slice(12, 16),
             'Op_Server0': slice(28, 32)
         }
-        return sum(observation[system_indices[system]])
+        
+        if system not in system_indices:
+            return 0.0
+        
+        # Get relevant observation values
+        values = observation[system_indices[system]]
+        
+        # Weight different indicators
+        anomaly_weight = 2.0  # Increased weight for anomalies
+        access_weight = 1.5   # Weight for access indicators
+        
+        threat = 0.0
+        for i, value in enumerate(values):
+            if i == 0:  # Anomaly indicator
+                threat += value * anomaly_weight
+            else:  # Access indicators
+                threat += value * access_weight
+                
+        return threat / (anomaly_weight + 2 * access_weight)  # Normalize
 
     def _get_active_systems(self, observation):
         """Get activity levels for all systems"""
