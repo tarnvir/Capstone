@@ -2,7 +2,7 @@ import inspect
 import os
 import time
 import numpy as np
-import torch
+import mlx
 
 from CybORG import CybORG
 from CybORG.Agents.SimpleAgents.HybridBlueAgent import HybridBlueAgent
@@ -11,6 +11,10 @@ from CybORG.Agents.Wrappers.ChallengeWrapper import ChallengeWrapper
 
 def train_blue_agent(episodes=20000, steps_per_episode=30):
     try:
+        # Check if MLX is available
+        device = mlx.get_device()  # Get the MLX device
+        print(f"Using device: {device}")
+
         # Get the path to CybORG installation
         path = str(inspect.getfile(CybORG))
         # Set path to scenario file
@@ -45,7 +49,7 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
             input_dim=52,         # Size of observation space
             hidden_dim=256,       # Size of hidden layers
             output_dim=len(action_space)  # Number of possible actions
-        )
+        ).to(device)
         
         # Initialize training metrics
         best_reward = float('-inf')  # Track best average reward
@@ -56,6 +60,8 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
         for episode in range(episodes):
             # Reset environment at start of episode
             observation = env.reset()
+            # Convert observation to tensor and send to device
+            observation = mlx.array(observation, dtype=mlx.float32).to(device)
             episode_reward = 0
             actions_taken = []
             
@@ -71,6 +77,8 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
                 
                 # Take step in environment
                 next_observation, reward, done, _ = env.step(action)
+                # Convert next observation to tensor and send to device
+                next_observation = mlx.array(next_observation, dtype=mlx.float32).to(device)
                 # Store reward with current observation
                 hybrid_agent.store_reward(reward, observation)
                 episode_reward += reward
@@ -111,7 +119,7 @@ def train_blue_agent(episodes=20000, steps_per_episode=30):
 
 if __name__ == "__main__":
     # Set random seeds for reproducibility
-    torch.manual_seed(0)
+    mlx.manual_seed(0)
     np.random.seed(0)
     # Start training
     agent = train_blue_agent(episodes=20000, steps_per_episode=30)
