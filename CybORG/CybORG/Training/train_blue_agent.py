@@ -82,8 +82,11 @@ def train(env, input_dims, action_space,
             print('Checkpoint saved')
 
         if i_episode % print_interval == 0:
-            running_reward = int((running_reward / print_interval))
-            print('Episode {} \t Avg reward: {}'.format(i_episode, running_reward))
+            avg_reward = running_reward / print_interval
+            print(f'Episode {i_episode} \t' 
+                  f'Avg reward: {avg_reward:.3f} \t'
+                  f'Last action: {agent.last_action} \t'
+                  f'Threat level: {np.sum(agent.scan_state)}')
             running_reward = 0
 
 
@@ -94,15 +97,18 @@ if __name__ == '__main__':
     random.seed(0)
     np.random.seed(0)
 
-    # Adjusted hyperparameters
+    # Adjusted hyperparameters for better learning
     max_episodes = 20000
     max_timesteps = 30
-    update_timestep = 512  # More frequent updates
-    K_epochs = 10         # More policy updates
+    update_timestep = 256  # More frequent updates
+    K_epochs = 12         # More policy updates
     eps_clip = 0.2
     gamma = 0.99
-    lr = 0.0001          # Lower learning rate for stability
+    lr = 0.00005         # Lower learning rate for stability
     betas = [0.9, 0.999]
+
+    # Add entropy coefficient for exploration
+    entropy_coef = 0.01  # Encourage exploration
 
     # Simplified action space focusing on critical actions
     action_space = [

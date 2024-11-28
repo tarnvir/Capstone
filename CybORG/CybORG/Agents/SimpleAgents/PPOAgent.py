@@ -180,26 +180,40 @@ class PPOAgent(BaseAgent):
         return action_
 
     def store(self, reward, done):
-        """Store experience in memory with enhanced reward shaping"""
-        # Base reward
+        """Store experience in memory with more informative reward shaping"""
+        # Base reward from environment
         shaped_reward = reward
         
-        # Defensive action bonuses
-        if self.last_action in [133, 134, 135, 139]:  # restore actions
-            shaped_reward += 0.5  # Increased bonus for restore
-        elif self.last_action in [3, 4, 5, 9]:  # analyse actions
-            shaped_reward += 0.3  # Increased for analysis
-        elif self.last_action in [16, 17, 18, 22]:  # remove actions
-            shaped_reward += 0.4  # New bonus for remove actions
-        
-        # Early warning bonus - convert list to numpy array for sum
+        # Only apply defensive bonuses if there's activity
         scan_state_array = np.array(self.scan_state)
-        if np.sum(scan_state_array) > 0:  # If scans detected
-            shaped_reward += 0.2
+        threat_level = np.sum(scan_state_array)
+        
+        if threat_level > 0:  # If there's suspicious activity
+            # Larger bonuses for appropriate responses to threats
+            if self.last_action in [133, 134, 135, 139]:  # restore actions
+                shaped_reward += 1.0  # Big bonus for restore when needed
+            elif self.last_action in [3, 4, 5, 9]:  # analyse actions
+                shaped_reward += 0.7  # Good bonus for analysis during threats
+            elif self.last_action in [16, 17, 18, 22]:  # remove actions
+                shaped_reward += 0.8  # Good bonus for remove during threats
+                
+            # Extra bonus for quick response
+            if scan_state_array.max() == 2:  # If this is a new threat
+                shaped_reward += 0.5  # Bonus for responding to new threats
+        else:
+            # Small bonuses for proactive monitoring
+            if self.last_action in [3, 4, 5, 9]:  # analyse actions
+                shaped_reward += 0.2  # Small bonus for staying vigilant
+                
+            # Small penalty for unnecessary aggressive actions
+            if self.last_action in [133, 134, 135, 139]:  # restore actions
+                shaped_reward -= 0.3  # Penalty for restore when not needed
+            elif self.last_action in [16, 17, 18, 22]:  # remove actions
+                shaped_reward -= 0.2  # Penalty for remove when not needed
         
         # Penalty for redundant actions
         if self.last_action in sum(self.current_decoys.values(), []):
-            shaped_reward -= 0.2
+            shaped_reward -= 0.4
         
         # Convert reward to tensor
         if not isinstance(shaped_reward, torch.Tensor):
