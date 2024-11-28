@@ -1,3 +1,0 @@
-CybORG v2.1, Scenario2, Commit Hash: b6cb7403b198021ac9355a6f02ac26f925379c05
-author: test, team: test, technique: test
-wrappers: ChallengeWrapper(env=env, agent_name='Blue')
