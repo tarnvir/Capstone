@@ -9,12 +9,13 @@ from CybORG.Agents.SimpleAgents.BaseAgent import BaseAgent
 from CybORG.Agents.SimpleAgents.BlueLoadAgent import BlueLoadAgent
 from CybORG.Agents.SimpleAgents.BlueReactAgent import BlueReactRemoveAgent
 from CybORG.Agents.SimpleAgents.Meander import RedMeanderAgent
+from CybORG.Agents.SimpleAgents.SleepBlueAgent import SleepBlueAgent
 from CybORG.Agents.Wrappers.EnumActionWrapper import EnumActionWrapper
 from CybORG.Agents.Wrappers.FixedFlatWrapper import FixedFlatWrapper
 from CybORG.Agents.Wrappers.OpenAIGymWrapper import OpenAIGymWrapper
 from CybORG.Agents.Wrappers.ReduceActionSpaceWrapper import ReduceActionSpaceWrapper
 from CybORG.Agents.Wrappers import ChallengeWrapper
-from CybORG.Agents.SimpleAgents.HybridBlueAgent import HybridBlueAgent
+from CybORG.Agents.SimpleAgents.PPOAgent import PPOAgent
 
 MAX_EPS = 100
 agent_name = 'Blue'
@@ -26,43 +27,26 @@ def get_git_revision_hash() -> str:
     return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
 
 if __name__ == "__main__":
-    # Define action space first
-    action_space = [
-        1,                    # monitor
-        133, 134, 135, 139,  # restore actions for enterprise and opserver
-        3, 4, 5, 9,          # analyse actions for enterprise and opserver
-        16, 17, 18, 22,      # remove malware from enterprise and opserver
-        11, 12, 13, 14,      # analyse actions for user hosts
-        141, 142, 143, 144,  # restore actions for user hosts
-        132,                 # restore defender system
-        2,                   # analyse defender system
-        15, 24, 25, 26, 27,  # remove malware from defender and user hosts
-        # Add decoy actions
-        69, 70, 71, 72,      # Deploy decoy on enterprise0-2 and opserver0
-        73, 74, 75, 76,      # Deploy decoy on user hosts
-        77                   # Deploy decoy on defender
-    ]
-
-    # Initialize agent with proper dimensions
-    agent = HybridBlueAgent(
-        input_dim=52,
-        hidden_dim=256,
-        output_dim=len(action_space)
-    )
-    
-    # Load the trained model
-    agent.load('CybORG/Checkpoints/best_model.pt')
 
     cyborg_version = CYBORG_VERSION
     scenario = 'Scenario2'
     commit_hash = get_git_revision_hash()
-    name = input('Name: ')
-    team = input("Team: ")
-    name_of_agent = input("Name of technique: ")
+    name = "Group 11"
+    team = "Carleton Capstone"
+    name_of_agent = "PPO"
 
     lines = inspect.getsource(wrap)
     wrap_line = lines.split('\n')[1].split('return ')[1]
 
+    agent = PPOAgent(
+        input_dim=52,  # Base observation size
+        output_dim=12, # Size of action space
+        lr=0.0001,
+        gamma=0.99,
+        K_epochs=10,
+        eps_clip=0.2,
+        start_actions=[3, 4, 5, 9]  # Start with analysis actions
+    )
     print(f'Using agent {agent.__class__.__name__}')
 
     file_name = str(inspect.getfile(CybORG))[:-10] + '/Evaluation/' + time.strftime("%Y%m%d_%H%M%S") + f'_{agent.__class__.__name__}.txt'
@@ -83,6 +67,8 @@ if __name__ == "__main__":
             wrapped_cyborg = wrap(cyborg)
             
             observation = wrapped_cyborg.reset()
+            action_space = wrapped_cyborg.get_action_space(agent_name)
+
             total_reward = []
             actions = []
             
@@ -90,16 +76,10 @@ if __name__ == "__main__":
                 r = []
                 a = []
                 for j in range(num_steps):
-                    # Get action space for current step
-                    current_action_space = wrapped_cyborg.get_action_space(agent_name)
-                    # Get action using our action space
                     action = agent.get_action(observation, action_space)
                     observation, rew, done, info = wrapped_cyborg.step(action)
                     r.append(rew)
                     a.append((str(cyborg.get_last_action('Blue')), str(cyborg.get_last_action('Red'))))
-                    
-                    if done:
-                        break
                 
                 # Store episode results
                 total_reward.append(sum(r))

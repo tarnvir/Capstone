@@ -2,8 +2,11 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Set device to GPU if available, else CPU
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# Use MPS if available (Apple Silicon), else CPU
+device = (torch.device("mps") 
+          if torch.backends.mps.is_available() 
+          else torch.device("cpu"))
+print(f"Using device: {device}")
 
 class ActorCritic(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -14,24 +17,30 @@ class ActorCritic(nn.Module):
         """
         super(ActorCritic, self).__init__()
         
-        # Actor network - outputs action probabilities
-        self.actor = nn.Sequential(
-            nn.Linear(input_dim, 64),     # First hidden layer
-            nn.ReLU(),                    # Activation function
-            nn.Linear(64, 64),            # Second hidden layer
-            nn.ReLU(),                    # Activation function
-            nn.Linear(64, output_dim),    # Output layer
-            nn.Softmax(dim=-1)            # Convert to probabilities
-        )
+        # Adjust input dimension for scan state
+        self.input_dim = input_dim  # Now includes observation + scan state
         
-        # Critic network - outputs state value estimate
+        # Actor network
+        self.actor = nn.Sequential(
+            nn.Linear(self.input_dim, 64),  # Input now matches observation + scan state
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+            nn.Softmax(dim=-1)
+        ).to(device)  # Move to MPS
+        
+        # Critic network
         self.critic = nn.Sequential(
-            nn.Linear(input_dim, 64),     # First hidden layer
-            nn.ReLU(),                    # Activation function
-            nn.Linear(64, 64),            # Second hidden layer
-            nn.ReLU(),                    # Activation function
-            nn.Linear(64, 1)              # Output single value
-        )
+            nn.Linear(self.input_dim, 64),  # Input now matches observation + scan state
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        ).to(device)  # Move to MPS
+        
+        # Move entire model to MPS
+        self.to(device)
         
     def forward(self, state):
         """Forward pass through both actor and critic networks
@@ -40,10 +49,11 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (action_probs, state_value)
         """
-        # Convert state to tensor if needed
+        # Ensure state is on correct device
         if not isinstance(state, torch.Tensor):
-            state = torch.FloatTensor(state).to(device)
-        # Add batch dimension if needed
+            state = torch.FloatTensor(state)
+        state = state.to(device)
+        
         if len(state.shape) == 1:
             state = state.unsqueeze(0)
             
@@ -57,15 +67,17 @@ class ActorCritic(nn.Module):
         Returns:
             tuple: (action_logprobs, state_values, entropy)
         """
-        # Ensure states have correct shape and type
+        # Ensure states and actions are on correct device
         if not isinstance(states, torch.Tensor):
-            states = torch.FloatTensor(states).to(device)
+            states = torch.FloatTensor(states)
+        states = states.to(device)
+        
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.LongTensor(actions)
+        actions = actions.to(device)
+        
         if len(states.shape) == 1:
             states = states.unsqueeze(0)
-            
-        # Ensure actions have correct shape and type
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.LongTensor(actions).to(device)
         if len(actions.shape) == 1:
             actions = actions.unsqueeze(1)
             
@@ -88,3 +100,32 @@ class ActorCritic(nn.Module):
             state_values = state_values.unsqueeze(0)
             
         return action_logprobs, state_values, dist_entropy
+        
+    def act(self, state, memory, deterministic=False):
+        """Action selection with explicit device handling"""
+        # Ensure state is tensor on correct device
+        if not isinstance(state, torch.Tensor):
+            state = torch.FloatTensor(state).to(device)
+        else:
+            state = state.to(device)
+            
+        if len(state.shape) == 1:
+            state = state.unsqueeze(0)
+            
+        # Forward pass (already on MPS)
+        action_probs = self.actor(state)
+        
+        # Create distribution
+        dist = Categorical(action_probs)
+        
+        # Select action
+        if deterministic:
+            action = torch.argmax(action_probs)
+        else:
+            action = dist.sample()
+            
+        # Store action log probability
+        if memory is not None:
+            memory.logprobs.append(dist.log_prob(action))
+            
+        return action.item()

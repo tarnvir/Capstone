@@ -15,6 +15,10 @@ class BlueTableWrapper(BaseWrapper):
         self.baseline = None
         self.output_mode = output_mode
         self.blue_info = {}
+        
+        # Add tracking for B_line patterns
+        self.activity_history = []
+        self.critical_path_systems = ['User0', 'Enterprise0', 'Enterprise2', 'Op_Server0']
 
     def reset(self, agent='Blue'):        
         result = self.env.reset(agent)
@@ -137,43 +141,66 @@ class BlueTableWrapper(BaseWrapper):
         return anomaly_dict
 
     def _process_anomalies(self,anomaly_dict):
+        """Enhanced anomaly processing with B_line focus"""
         info = deepcopy(self.blue_info)
+        
+        # Track system compromises in order
+        compromised_systems = []
+        
         for hostid, host_anomalies in anomaly_dict.items():
             assert len(host_anomalies) > 0
+            
             if 'Processes' in host_anomalies:
                 connection_type = self._interpret_connections(host_anomalies['Processes'])
                 info[hostid][-2] = connection_type
+                
                 if connection_type == 'Exploit':
                     info[hostid][-1] = 'User'
                     self.blue_info[hostid][-1] = 'User'
+                    compromised_systems.append(hostid)
+                    
             if 'Files' in host_anomalies:
                 malware = [f['Density'] >= 0.9 for f in host_anomalies['Files']]
                 if any(malware):
                     info[hostid][-1] = 'Privileged'
                     self.blue_info[hostid][-1] = 'Privileged'
+                    
+        # Check for B_line pattern in compromised systems
+        if len(compromised_systems) >= 2:
+            # Check if compromises follow B_line's path
+            for i in range(len(self.critical_path_systems)-1):
+                if (self.critical_path_systems[i] in compromised_systems and 
+                    self.critical_path_systems[i+1] in compromised_systems):
+                    # Mark systems as high priority
+                    for sys in self.critical_path_systems[i:]:
+                        if sys in info:
+                            info[sys][-2] = 'B_line_Target'
 
         return info
 
-    def _interpret_connections(self,activity:list):                
+    def _interpret_connections(self, activity: list):
+        """Simplified but more sensitive connection interpretation"""
         num_connections = len(activity)
-
-        ports = set([item['Connections'][0]['local_port'] \
+        
+        # Get connection details
+        ports = set([item['Connections'][0]['local_port'] 
             for item in activity if 'Connections' in item])
         port_focus = len(ports)
-
-        remote_ports = set([item['Connections'][0].get('remote_port') \
+        
+        remote_ports = set([item['Connections'][0].get('remote_port') 
             for item in activity if 'Connections' in item])
         if None in remote_ports:
             remote_ports.remove(None)
 
-        if num_connections >= 3 and port_focus >=3:
+        # B_line typically uses specific ports and focused connections
+        if 4444 in remote_ports or 445 in ports or 3389 in ports:
+            # These ports are commonly used in B_line's attacks
+            anomaly = 'Exploit'
+        elif num_connections >= 3 and port_focus >= 3:
             anomaly = 'Scan'
-        elif 4444 in remote_ports:
+        elif num_connections >= 2 and port_focus == 1:
+            # Lower threshold for focused connections
             anomaly = 'Exploit'
-        elif num_connections >= 3 and port_focus == 1:
-            anomaly = 'Exploit'
-        elif 'Service Name' in activity[0]:
-            anomaly = 'None'
         else:
             anomaly = 'Scan'
 
@@ -212,11 +239,12 @@ class BlueTableWrapper(BaseWrapper):
         return table
 
     def _create_vector(self, success):
+        """Enhanced vector creation with B_line indicators"""
         table = self._create_blue_table(success)._rows
 
         proto_vector = []
         for row in table:
-            # Activity
+            # Activity encoding
             activity = row[3]
             if activity == 'None':
                 value = [0,0]
@@ -224,16 +252,18 @@ class BlueTableWrapper(BaseWrapper):
                 value = [1,0]
             elif activity == 'Exploit':
                 value = [1,1]
+            elif activity == 'B_line_Target':  # New activity type
+                value = [1,1,1]  # Extra bit for B_line detection
             else:
-                raise ValueError('Table had invalid Access Level')
+                raise ValueError('Table had invalid Activity')
             proto_vector.extend(value)
 
-            # Compromised
+            # Compromised encoding
             compromised = row[4]
             if compromised == 'No':
-                value = [0, 0]
+                value = [0,0]
             elif compromised == 'Unknown':
-                value = [1, 0]
+                value = [1,0]
             elif compromised == 'User':
                 value = [0,1]
             elif compromised == 'Privileged':
