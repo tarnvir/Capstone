@@ -147,5 +147,6 @@ if __name__ == '__main__':
           betas=betas, 
           ckpt_folder=ckpt_folder,
           print_interval=50, 
+          
           save_interval=200, 
           start_actions=start_actions)
