@@ -31,4 +31,6 @@ CybORG/Emulator/AWS/Config/awsconfig.ini
 CybORG/CybORG/Evaluation
 
 Models
+CybORG/Results
+CybORG/Results
 *.swp
