@@ -199,7 +199,7 @@ class PPOAgent(BaseAgent):
                 
             # Extra bonus for quick response
             if scan_state_array.max() == 2:  # If this is a new threat
-                shaped_reward += 0.5  # Bonus for responding to new threats
+                shaped_reward += 0.6  # Bonus for responding to new threats
         else:
             # Small bonuses for proactive monitoring
             if self.last_action in [3, 4, 5, 9]:  # analyse actions
@@ -207,9 +207,9 @@ class PPOAgent(BaseAgent):
                 
             # Small penalty for unnecessary aggressive actions
             if self.last_action in [133, 134, 135, 139]:  # restore actions
-                shaped_reward -= 0.3  # Penalty for restore when not needed
+                shaped_reward -= 0.35  # Penalty for restore when not needed
             elif self.last_action in [16, 17, 18, 22]:  # remove actions
-                shaped_reward -= 0.2  # Penalty for remove when not needed
+                shaped_reward -= 0.25  # Penalty for remove when not needed
         
         # Penalty for redundant actions
         if self.last_action in sum(self.current_decoys.values(), []):

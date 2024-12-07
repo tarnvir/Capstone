@@ -100,11 +100,11 @@ if __name__ == '__main__':
     # Adjusted hyperparameters for better learning
     max_episodes = 20000
     max_timesteps = 30
-    update_timestep = 256  # More frequent updates
+    update_timestep = 128  # More frequent updates
     K_epochs = 12         # More policy updates
-    eps_clip = 0.2
-    gamma = 0.99
-    lr = 0.00005         # Lower learning rate for stability
+    eps_clip = 0.25
+    gamma = 0.999
+    lr = 0.005         # Lower learning rate for stability
     betas = [0.9, 0.999]
 
     # Add entropy coefficient for exploration
