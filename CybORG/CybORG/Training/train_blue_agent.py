@@ -10,19 +10,15 @@ import random
 
 PATH = str(inspect.getfile(CybORG))
 PATH = PATH[:-10] + '/Shared/Scenarios/Scenario2.yaml'
-device = (torch.device("mps") 
-          if torch.backends.mps.is_available() 
-          else torch.device("cpu"))
-print(f"Training device: {device}")
-
 
 def train(env, input_dims, action_space,
           max_episodes, max_timesteps, update_timestep, K_epochs, eps_clip,
           gamma, lr, betas, ckpt_folder, print_interval=10, save_interval=100, start_actions=[]):
 
+    # Initialize agent with optimized parameters
     agent = PPOAgent(
-        input_dim=input_dims,
-        output_dim=len(action_space),
+        input_dims=input_dims,
+        action_space=action_space,
         lr=lr,
         betas=betas,
         gamma=gamma,
@@ -31,122 +27,106 @@ def train(env, input_dims, action_space,
         start_actions=start_actions
     )
     
-    # Set initial values including action space
+    # Initialize agent's values including greedy_decoys
     agent.set_initial_values(action_space)
-    agent.policy.to(device)
 
-    # Initialize tracking
-    best_reward = float('-inf')
+    # Training loop variables
     running_reward = 0
-    
-    # Training loop
+    time_step = 0
+
+    # Main training loop
     for i_episode in range(1, max_episodes + 1):
         state = env.reset()
         episode_reward = 0
         
         # Episode loop
         for t in range(max_timesteps):
-            # Get action index from agent
-            action_idx = agent.get_action(state)
+            time_step += 1
             
-            # Ensure action index is valid
-            action_idx = action_idx % len(action_space)  # Safety check
-            action = action_space[action_idx]
+            # Get action from agent
+            action = agent.get_action(state)
             
             # Take step in environment
-            next_state, reward, done, _ = env.step(action)
+            state, reward, done, _ = env.step(action)
             episode_reward += reward
             
             # Store experience
             agent.store(reward, done)
-            
-            state = next_state
-            
-            # Update if memory buffer is full
-            if len(agent.memory.states) >= agent.memory.buffer_size:
+
+            # Update if enough steps have been taken
+            if time_step % update_timestep == 0:
                 agent.train()
                 agent.clear_memory()
-        
-        # Update running reward
-        running_reward = 0.05 * episode_reward + (1 - 0.05) * running_reward
-        
-        # Save best model
-        if running_reward > best_reward:
-            best_reward = running_reward
-            torch.save(agent.policy.state_dict(), 
-                      os.path.join(ckpt_folder, 'best_model.pth'))
+                time_step = 0
 
+        # End episode
+        agent.end_episode()
+        running_reward = 0.05 * episode_reward + (1 - 0.05) * running_reward
+
+        # Save checkpoint
         if i_episode % save_interval == 0:
-            ckpt = os.path.join(ckpt_folder, '{}.pth'.format(i_episode))
+            ckpt = os.path.join(ckpt_folder, f'{i_episode}.pth')
             torch.save(agent.policy.state_dict(), ckpt)
             print('Checkpoint saved')
 
+        # Print metrics
         if i_episode % print_interval == 0:
-            avg_reward = running_reward / print_interval
             print(f'Episode {i_episode} \t' 
-                  f'Avg reward: {avg_reward:.3f} \t'
-                  f'Last action: {agent.last_action} \t'
-                  f'Threat level: {np.sum(agent.scan_state)}')
-            running_reward = 0
-
+                  f'Avg reward: {running_reward:.3f}')
 
 if __name__ == '__main__':
-
-    # set seeds for reproducibility
+    # Set seeds for reproducibility
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
 
-    # Adjusted hyperparameters for better learning
-    max_episodes = 20000
-    max_timesteps = 30
-    update_timestep = 128  # More frequent updates
-    K_epochs = 12         # More policy updates
-    eps_clip = 0.25
-    gamma = 0.999
-    lr = 0.005         # Lower learning rate for stability
-    betas = [0.9, 0.999]
+    # Optimized hyperparameters from successful implementation
+    max_episodes = 100000  # Much longer training
+    max_timesteps = 100    # Full episode length
+    update_timestep = 20000  # Much larger buffer
+    K_epochs = 6           # Fewer policy updates
+    eps_clip = 0.2        # Standard PPO clip
+    gamma = 0.99         # Standard discount
+    lr = 0.002          # Higher learning rate
+    betas = [0.9, 0.990]
 
-    # Add entropy coefficient for exploration
-    entropy_coef = 0.01  # Encourage exploration
-
-    # Simplified action space focusing on critical actions
+    # Focused action space
     action_space = [
-        133, 134, 135, 139,  # restore critical systems
-        3, 4, 5, 9,         # analyse critical systems
-        16, 17, 18, 22      # remove critical systems
+        133, 134, 135, 139,  # restore enterprise and opserver
+        3, 4, 5, 9,          # analyse enterprise and opserver
+        16, 17, 18, 22       # remove enterprise and opserver
     ]
 
-    # Start with analysis actions
-    start_actions = [3, 4, 5, 9]  # Start with system analysis
+    # Start with critical decoys
+    start_actions = [1004, 1004, 1000]  # user2 decoy x2, ent0 decoy
 
-    # Training setup
+    # Setup training folder
     folder = 'bline'
     ckpt_folder = os.path.join(os.getcwd(), "Models", folder)
     if not os.path.exists(ckpt_folder):
         os.makedirs(ckpt_folder)
 
-    # Environment setup
+    # Setup environment
     CYBORG = CybORG(PATH, 'sim', agents={'Red': B_lineAgent})
     env = ChallengeWrapper(env=CYBORG, agent_name="Blue")
-    input_dims = env.observation_space.shape[0] + 10  # Add 10 for scan state
+    input_dims = env.observation_space.shape[0]
 
     # Print training info
     print(f"Input dimensions: {input_dims}")
     print(f"Action space size: {len(action_space)}")
     print(f"Starting training...")
 
+    # Start training
     train(env, input_dims, action_space,
-          max_episodes=max_episodes, 
+          max_episodes=max_episodes,
           max_timesteps=max_timesteps,
-          update_timestep=update_timestep, 
+          update_timestep=update_timestep,
           K_epochs=K_epochs,
-          eps_clip=eps_clip, 
-          gamma=gamma, 
+          eps_clip=eps_clip,
+          gamma=gamma,
           lr=lr,
-          betas=betas, 
+          betas=betas,
           ckpt_folder=ckpt_folder,
-          print_interval=50, 
-          
-          save_interval=200, 
+          print_interval=50,
+          save_interval=200,
           start_actions=start_actions)

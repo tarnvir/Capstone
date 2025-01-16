@@ -1,19 +1,31 @@
 class Memory:
-    def __init__(self, buffer_size=2048):
+    """Efficient memory management for PPO"""
+    def __init__(self, buffer_size=20000):
         self.states = []
         self.actions = []
         self.rewards = []
-        self.logprobs = []
         self.is_terminals = []
+        self.logprobs = []
         self.buffer_size = buffer_size
-
+        
     def clear_memory(self):
-        """Clear all memory buffers"""
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.logprobs = []
-        self.is_terminals = []
+        """Efficiently clear memory"""
+        del self.states[:]
+        del self.actions[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
+        del self.logprobs[:]
+        
+    def add(self, state, action, reward, done, logprob):
+        """Add experience with buffer management"""
+        if len(self.states) >= self.buffer_size:
+            self.clear_memory()
+            
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.is_terminals.append(done)
+        self.logprobs.append(logprob)
     
     def get_buffer(self):
         """Get current buffer state"""
