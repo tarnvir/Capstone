@@ -1,70 +1,73 @@
 import copy
 
-from .PPOAgent import PPOAgent
-from .SleepBlueAgent import SleepBlueAgent
+from CybORG.Agents.SimpleAgents.PPOAgent import PPOAgent
+from CybORG.Agents.SimpleAgents.SleepAgent import SleepAgent
 import numpy as np
 import os
+import torch
 
 class HybridBlueAgent(PPOAgent):
     def __init__(self):
-        self.action_space = [133, 134, 135, 139, 3, 4, 5, 9, 16, 17, 18, 22, 11, 12, 13, 14, 141, 142, 143, 144,
-                             132, 2, 15, 24, 25, 26, 27]
+        self.action_space = [
+            133, 134, 135, 139,  # restore enterprise and opserver
+            3, 4, 5, 9,          # analyse enterprise and opserver
+            16, 17, 18, 22       # remove enterprise and opserver
+        ]
+        self.agent = None
+        self.start_actions = [1004, 1004, 1000]  # Initial decoy placements
         self.end_episode()
 
     def get_action(self, observation, action_space=None):
+        if self.agent is None:
+            self.agent = self.load_bline()
+        return self.agent.get_action(observation, action_space)
 
-        action = None
-        # keep track of scans
-        old_scan_state = copy.copy(self.scan_state)
-        super().add_scan(observation)
-        # start actions
-        if len(self.start_actions) > 0:
-            action = self.start_actions[0]
-            self.start_actions = self.start_actions[1:]
+    def end_episode(self):
+        if self.agent is not None:
+            self.agent.end_episode()
 
-        # load agent based on fingerprint
-        elif self.agent_loaded is False:
-            if self.fingerprint_meander():
-                self.agent = self.load_meander()
-            elif self.fingerprint_bline():
-                self.agent = self.load_bline()
-            else:
-                self.agent = self.load_sleep()
-
-            self.agent_loaded = True
-            # add decoys and scan state
-            self.agent.current_decoys = {1000: [55], # enterprise0
-                                         1001: [], # enterprise1
-                                         1002: [], # enterprise2
-                                         1003: [], # user1
-                                         1004: [51, 116], # user2
-                                         1005: [], # user3
-                                         1006: [], # user4
-                                         1007: [], # defender
-                                         1008: []} # opserver0
-            # add old since it will add new scan in its own action (since recieves latest observation)
-            self.agent.scan_state = old_scan_state
-
-
-        # take action of agent
-        if action is None:
-            action = self.agent.get_action(observation)
-        return action
+    def set_initial_values(self, action_space, observation):
+        if self.agent is not None:
+            self.agent.set_initial_values(self.action_space, observation)
 
     def load_sleep(self):
         return SleepBlueAgent()
 
     def load_bline(self):
-        ckpt = os.path.join(os.getcwd(),"Models","bline","model.pth")
-        return PPOAgent(52, self.action_space, restore=True, ckpt=ckpt,
-                       deterministic=True, training=False)
-
+        """Load or create PPO agent with proper initialization"""
+        # Define model paths
+        base_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        models_path = os.path.join(base_path, "Models", "bline")
+        ckpt = os.path.join(models_path, "model.pth")
+        
+        # Create models directory if it doesn't exist
+        os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+        
+        # Check if model exists
+        if os.path.exists(ckpt):
+            print(f"Loading model from {ckpt}")
+            return PPOAgent(52, self.action_space, restore=True, ckpt=ckpt,
+                          deterministic=True, training=False, start_actions=self.start_actions)
+        else:
+            print(f"No model found at {ckpt}, creating new agent")
+            # Create new agent
+            agent = PPOAgent(52, self.action_space, restore=False,
+                           deterministic=True, training=False, start_actions=self.start_actions)
+            
+            # Initialize networks
+            agent.set_initial_values(self.action_space)
+            
+            # Save initial model
+            torch.save(agent.policy.state_dict(), ckpt)
+            print(f"Saved initial model to {ckpt}")
+            
+            return agent
 
     def load_meander(self):
-        ckpt = os.path.join(os.getcwd(),"Models","meander","model.pth")
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        ckpt = os.path.join(base_dir, "Models", "meander", "model.pth")
         return PPOAgent(52, self.action_space, restore=True, ckpt=ckpt,
                        deterministic=True, training=False)
-
 
     def fingerprint_meander(self):
         return np.sum(self.scan_state) == 3

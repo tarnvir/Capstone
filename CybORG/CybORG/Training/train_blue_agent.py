@@ -82,12 +82,12 @@ if __name__ == '__main__':
 
     # Optimized hyperparameters from successful implementation
     max_episodes = 100000  # Much longer training
-    max_timesteps = 100    # Full episode length
-    update_timestep = 20000  # Much larger buffer
+    max_timesteps = 50    # Full episode length
+    update_timestep = 30000  # Much larger buffer
     K_epochs = 6           # Fewer policy updates
-    eps_clip = 0.2        # Standard PPO clip
-    gamma = 0.99         # Standard discount
-    lr = 0.002          # Higher learning rate
+    eps_clip = 0.25        # Standard PPO clip
+    gamma = 0.97         # Standard discount
+    lr = 0.003          # Higher learning rate
     betas = [0.9, 0.990]
 
     # Focused action space

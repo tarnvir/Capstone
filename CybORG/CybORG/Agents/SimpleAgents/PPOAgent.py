@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from CybORG.Agents import BaseAgent
 import numpy as np
+import copy
 
 device = (torch.device("mps") 
           if torch.backends.mps.is_available() 
@@ -21,7 +22,7 @@ class PPOAgent(BaseAgent):
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
-        self.input_dims = input_dims + 10  # Add scan state dimension immediately
+        self.input_dims = input_dims + 10
         self.restore = restore
         self.ckpt = ckpt
         self.deterministic = deterministic
@@ -46,6 +47,16 @@ class PPOAgent(BaseAgent):
         self.action_space = action_space + self.decoy_ids
         self.end_episode()  # Initialize decoys and scan state
 
+    def add_decoy(self, action, host):
+        """Add decoy with improved tracking"""
+        if action not in self.current_decoys[host]:
+            self.current_decoys[host].append(action)
+
+    def remove_decoy(self, action, host):
+        """Remove decoy with validation"""
+        if action in self.current_decoys[host]:
+            self.current_decoys[host].remove(action)
+
     def add_scan(self, observation):
         indices = [0, 4, 8, 12, 28, 32, 36, 40, 44, 48]
         for id, index in enumerate(indices):
@@ -54,74 +65,19 @@ class PPOAgent(BaseAgent):
                 self.scan_state[id] = 2
                 break
 
-    def add_decoy(self, action, host):
-        """Add decoy with improved tracking"""
-        if action not in self.current_decoys[host]:
-            self.current_decoys[host].append(action)
-            return True
-        return False
 
-    def remove_decoy(self, action, host):
-        """Remove decoy with validation"""
-        if action in self.current_decoys[host]:
-            self.current_decoys[host].remove(action)
-            return True
-        return False
-
-    def select_decoy(self, host, observation):
-        """Improved decoy selection strategy"""
-        try:
-            # Check if host has any decoys defined
-            if not self.greedy_decoys[host]:  # If empty list
-                # Fall back to analyze action for that host
-                if host in range(1000, 1003):  # enterprise0-2
-                    return 3 + (host - 1000)  # returns 3,4,5
-                elif host == 1008:  # opserver0
-                    return 9
-                else:  # user hosts
-                    return 11 + (host - 1003)  # returns 11-14 for users
-            
-            # Try to place critical decoy first
-            available_decoys = [d for d in self.greedy_decoys[host] 
-                              if d not in self.current_decoys[host]]
-            if available_decoys:
-                action = available_decoys[0]
-                self.add_decoy(action, host)
-                return action
-            
-            # If no decoys available, use policy for alternative action
-            if not self.training:
-                state = torch.FloatTensor(observation.reshape(1, -1)).to(device)
-                actions = self.old_policy.act(state, self.memory, full=True)
-                max_actions = torch.sort(actions, dim=1, descending=True).indices[0]
-                
-                for action_ in max_actions:
-                    a = self.action_space[action_]
-                    # Check if action is valid decoy placement
-                    if a in self.current_decoys:
-                        if len(self.current_decoys[a]) < len(self.greedy_decoys[a]):
-                            return self.select_decoy(a, observation)
-                    # Or valid non-restore action
-                    elif a not in self.restore_decoy_mapping:
-                        return a
-                    
-            # Default to analyze action if no other options
-            if host in range(1000, 1003):  # enterprise0-2
-                return 3 + (host - 1000)
-            elif host == 1008:  # opserver0
-                return 9
-            else:  # user hosts
-                return 11 + (host - 1003)
-            
-        except Exception as e:
-            print(f"Error in decoy selection: {e}")
-            # Return safe default action (analyze)
-            return 3  # analyze enterprise0
+      # concatenate the observation with the scan state
+    def pad_observation(self, observation, old=False):
+        if old:
+            # added for store transition, remnants of DQN
+            return np.concatenate((observation, self.scan_state_old))
+        else:
+            return np.concatenate((observation, self.scan_state))
 
     def get_action(self, observation, action_space=None):
         # Process observation
         self.add_scan(observation)
-        observation = np.concatenate((observation, self.scan_state))
+        observation = self.pad_observation(observation)
         state = torch.FloatTensor(observation.reshape(1, -1)).to(device)
         
         # Get action from policy
@@ -150,6 +106,48 @@ class PPOAgent(BaseAgent):
         # Simple storage without reward shaping
         self.memory.rewards.append(reward)
         self.memory.is_terminals.append(done)
+
+    def clear_memory(self):
+        """Clear the memory buffer"""
+        self.memory.clear_memory()
+
+    def select_decoy(self, host, observation):
+        try:
+            # pick the top remaining decoy
+            action = [a for a in self.greedy_decoys[host] if a not in self.current_decoys[host]][0]
+            self.add_decoy(action, host)
+        except:
+            # # otherwise just use the remove action on that host
+            # action = self.host_to_remove[host]
+
+            # pick the top decoy again (a non-action)
+            if self.training:
+                action = self.greedy_decoys[host][0]
+
+            # pick the next best available action (deterministic)
+            else:
+                state = torch.FloatTensor(observation.reshape(1, -1)).to(device)
+                actions = self.old_policy.act(state, self.memory, full=True)
+
+                max_actions = torch.sort(actions, dim=1, descending=True)
+                max_actions = max_actions.indices
+                max_actions = max_actions.tolist()
+
+                # don't need top action since already know it can't be used (hence could put [1:] here, left for clarity)
+                for action_ in max_actions[0]:
+                    a = self.action_space[action_]
+                    # if next best action is decoy, check if its full also
+                    if a in self.current_decoys.keys():
+                        if len(self.current_decoys[a]) < len(self.greedy_decoys[a]):
+                            action = self.select_decoy(a,observation)
+                            self.add_decoy(action, a)
+                            break
+                    else:
+                        # don't select a next best action if "restore", likely too aggressive for 30-50 episodes
+                        if a not in self.restore_decoy_mapping.keys():
+                            action = a
+                            break
+        return action
 
     def train(self):
         # Calculate returns
@@ -184,9 +182,12 @@ class PPOAgent(BaseAgent):
             # Calculate surrogate losses
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
-            
-            # Calculate final loss
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MSE_loss(state_values, returns) - 0.01 * dist_entropy
+            actor_loss = - torch.min(surr1, surr2)
+
+            critic_loss = 0.5 * self.MSE_loss(returns, state_values) - 0.01 * dist_entropy
+
+            loss = actor_loss + critic_loss
+
             
             # Update policy
             self.optimizer.zero_grad()
@@ -197,26 +198,49 @@ class PPOAgent(BaseAgent):
         self.old_policy.load_state_dict(self.policy.state_dict())
 
     def end_episode(self):
-        self.current_decoys = {id: [] for id in range(1000, 1009)}
+            # 9 possible decoys: enterprise 0-2 and user 1-4, defender, opserver0 (cant do actions on user0)
+        self.current_decoys = {1000: [], # enterprise0
+                               1001: [], # enterprise1
+                               1002: [], # enterprise2
+                               1003: [], # user1
+                               1004: [], # user2
+                               1005: [], # user3
+                               1006: [], # user4
+                               1007: [], # defender
+                               1008: []} # opserver0
+        # 10 possible scans: defender, enterprise 0-2, user 0-4, opserver
         self.scan_state = np.zeros(10)
-        self.start_actions = self.start.copy()
+        # remnants of DQNAgent for store_transitions
+        self.scan_state_old = np.zeros(10)
+        # add start actions
+        self.start_actions = copy.copy(self.start)
 
     def set_initial_values(self, action_space, observation=None):
         """Initialize agent with focused action space and decoy management"""
         self.memory = Memory()
         
         # Initialize greedy decoys focused on critical systems
-        self.greedy_decoys = {
-            1000: [55, 107],     # enterprise0 (critical) decoys
-            1001: [43],          # enterprise1 (critical) decoys
-            1002: [44],          # enterprise2 (critical) decoys
-            1003: [],            # user1 (non-critical)
-            1004: [51, 116],     # user2 (initial target)
-            1005: [],            # user3 (non-critical)
-            1006: [],            # user4 (non-critical)
-            1007: [54, 106],     # defender (critical)
-            1008: [61, 35]       # opserver0 (critical)
-        }
+        self.greedy_decoys = {1000: [55, 107, 120, 29],  # enterprise0 decoy actions
+                              1001: [43],  # enterprise1 decoy actions
+                              1002: [44],  # enterprise2 decoy actions
+                              1003: [37, 115, 76, 102],  # user1 decoy actions
+                              1004: [51, 116, 38, 90],  # user2 decoy actions
+                              1005: [130, 91],  # user3 decoy actions
+                              1006: [131],  # user4 decoys
+                              1007: [54, 106, 28, 119], # defender decoys
+                              1008: [61, 35, 113, 126]} # opserver0 decoys
+
+        # added to simplify / for clarity
+        self.all_decoys = {55: 1000, 107: 1000, 120: 1000, 29: 1000,
+                           43: 1001,
+                           44: 1002,
+                           37: 1003, 115: 1003, 76: 1003, 102: 1003,
+                           51: 1004, 116: 1004, 38: 1004, 90: 1004,
+                           130: 1005, 91: 1005,
+                           131: 1006,
+                           54: 1007, 106: 1007, 28: 1007, 119: 1007,
+                           126: 1008, 61: 1008, 113: 1008, 35: 1008}
+
 
         # Mapping of restore actions to decoys
         self.restore_decoy_mapping = dict()
@@ -239,6 +263,4 @@ class PPOAgent(BaseAgent):
         self.old_policy = ActorCritic(self.input_dims, self.n_actions).to(device)
         self.old_policy.load_state_dict(self.policy.state_dict())
 
-    def clear_memory(self):
-        """Clear the memory buffer"""
-        self.memory.clear_memory()
+   

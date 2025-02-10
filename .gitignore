@@ -28,7 +28,8 @@ CybORG/Shared/Config/config.ini
 
 CybORG/Emulator/AWS/Config/awsconfig.ini
 
-CybORG/CybORG/Evaluation
+CybORG/CybORG/Evaluation/*
+!CybORG/CybORG/Evaluation/evaluation.py
 
 Models
 CybORG/Results
